@@ -6,9 +6,14 @@ from app.schemas.schemas import (
     WordResponse,
     WordbookWordCreate, WordbookWordUpdate, WordbookWordResponse,
     ExtractWordsRequest, ExtractWordsResponse,
+    BatchWordsRequest, BatchWordsResponse, BatchWordResult,
 )
 from app.services.word_service import extract_unknown_words
-from app.services.dictionary_service import fetch_word_meanings
+from app.services.word_lookup_service import (
+    get_or_create_word,
+    get_word_with_meanings,
+    add_meanings_to_wordbook,
+)
 
 router = APIRouter(prefix="/words", tags=["Words"])
 
@@ -22,51 +27,68 @@ async def add_word(word: str):
     Free Dictionary API から意味・品詞・例文を取得して meanings / example_sentences に保存。
     すでに存在する場合はそのまま返す。
     """
-    db = get_supabase()
-    word_lower = word.lower()
+    result = await get_or_create_word(word)
+    return get_word_with_meanings(result["word_id"])
 
-    # 既存チェック
-    existing = db.table("words").select("id").eq("word", word_lower).execute()
-    if existing.data:
-        word_id = existing.data[0]["id"]
-    else:
-        # words に insert
-        inserted = db.table("words").insert({"word": word_lower}).execute()
-        word_id = inserted.data[0]["id"]
 
-        # Free Dictionary API から意味取得
-        meanings = await fetch_word_meanings(word_lower)
-        for m in meanings:
-            meaning_row = db.table("meanings").insert({
-                "word_id": word_id,
-                "part_of_speech": m["part_of_speech"],
-                "definition": m["definition"],
-                "tier": None,  # ユーザー追加単語はtierなし
-            }).execute()
-            meaning_id = meaning_row.data[0]["id"]
+# ── 未知単語の一括登録（OCR結果 → 単語帳へ） ──────────────────────────────────
 
-            if m.get("example"):
-                db.table("example_sentences").insert({
-                    "meaning_id": meaning_id,
-                    "sentence": m["example"],
-                }).execute()
+@router.post("/batch", response_model=BatchWordsResponse, status_code=201)
+async def add_words_batch(payload: BatchWordsRequest):
+    """
+    未知単語のリストを受け取り、それぞれ:
+      1. words/meanings テーブルに存在しなければ Free Dictionary API から取得して登録
+      2. 取得できた meaning を user_id の単語帳（未学習）に追加
+    フレーズ（スペースを含む語）は Free Dictionary API では引けないことが多いため、
+    意味が見つからなかった単語も results に含め、呼び出し側で判断できるようにする。
+    """
+    results: list[BatchWordResult] = []
+    registered_count = 0
+    skipped_no_meaning_count = 0
 
-    # 結果を返す（meanings + example_sentences を結合）
-    return _get_word_with_meanings(word_id)
+    # 重複を除去しつつ順序を保持
+    seen: set[str] = set()
+    unique_words = []
+    for w in payload.words:
+        lower = w.strip().lower()
+        if lower and lower not in seen:
+            seen.add(lower)
+            unique_words.append(lower)
+
+    for word in unique_words:
+        try:
+            lookup = await get_or_create_word(word)
+        except Exception as e:
+            results.append(BatchWordResult(
+                word=word, status="error", meaning_count=0, error=str(e),
+            ))
+            continue
+
+        if lookup["meaning_count"] == 0:
+            skipped_no_meaning_count += 1
+            results.append(BatchWordResult(
+                word=word, status="no_meaning_found", meaning_count=0,
+            ))
+            continue
+
+        added_ids = await add_meanings_to_wordbook(payload.user_id, lookup["word_id"])
+        registered_count += 1
+        results.append(BatchWordResult(
+            word=word,
+            status="registered" if added_ids else "already_in_wordbook",
+            meaning_count=lookup["meaning_count"],
+        ))
+
+    return BatchWordsResponse(
+        total=len(unique_words),
+        registered_count=registered_count,
+        skipped_no_meaning_count=skipped_no_meaning_count,
+        results=results,
+    )
 
 
 def _get_word_with_meanings(word_id: int) -> dict:
-    db = get_supabase()
-    word_row = db.table("words").select("*").eq("id", word_id).execute().data[0]
-    meanings = (
-        db.table("meanings")
-        .select("*, example_sentences(*)")
-        .eq("word_id", word_id)
-        .execute()
-        .data
-    )
-    word_row["meanings"] = meanings
-    return word_row
+    return get_word_with_meanings(word_id)
 
 
 # ── Wordbook CRUD ─────────────────────────────────────────────────────────────

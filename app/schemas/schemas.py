@@ -74,6 +74,26 @@ class ExtractWordsResponse(BaseModel):
     unknown_count: int
 
 
+# --- Batch word registration (OCR結果 → 単語帳一括登録) ---
+class BatchWordsRequest(BaseModel):
+    user_id: str
+    words: list[str]
+
+
+class BatchWordResult(BaseModel):
+    word: str
+    status: str  # "registered" | "already_in_wordbook" | "no_meaning_found" | "error"
+    meaning_count: int
+    error: Optional[str] = None
+
+
+class BatchWordsResponse(BaseModel):
+    total: int
+    registered_count: int
+    skipped_no_meaning_count: int
+    results: list[BatchWordResult]
+
+
 # --- User ---
 class UserLevelUpdate(BaseModel):
     level: str
