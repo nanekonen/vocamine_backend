@@ -1,3 +1,6 @@
+from io import BytesIO
+from pathlib import Path
+
 import base64
 from google.cloud import vision
 from google.oauth2 import service_account
@@ -6,8 +9,13 @@ from app.core.config import settings
 
 def _get_vision_client() -> vision.ImageAnnotatorClient:
     if settings.google_application_credentials:
+        credentials_path = Path(settings.google_application_credentials)
+        if not credentials_path.exists():
+            raise ValueError(
+                f"Google credentials file not found: {settings.google_application_credentials}"
+            )
         credentials = service_account.Credentials.from_service_account_file(
-            settings.google_application_credentials
+            str(credentials_path)
         )
         return vision.ImageAnnotatorClient(credentials=credentials)
     # Falls back to Application Default Credentials (ADC)
@@ -33,9 +41,13 @@ async def extract_text_from_image(image_bytes: bytes) -> str:
 
 async def extract_text_from_pdf_page(pdf_bytes: bytes) -> str:
     """
-    Use Vision API async batch for PDF. For single pages, DOCUMENT_TEXT_DETECTION
-    on the raw bytes works well enough.
+    Extract embedded text from PDF first. If the PDF is scanned and contains no
+    text layer, fall back to Vision API.
     """
+    text = _extract_embedded_pdf_text(pdf_bytes)
+    if text:
+        return text
+
     client = _get_vision_client()
     image = vision.Image(content=pdf_bytes)
     response = client.document_text_detection(image=image)
@@ -44,3 +56,21 @@ async def extract_text_from_pdf_page(pdf_bytes: bytes) -> str:
         raise ValueError(f"Vision API error: {response.error.message}")
 
     return response.full_text_annotation.text.strip()
+
+
+def _extract_embedded_pdf_text(pdf_bytes: bytes) -> str:
+    try:
+        from pypdf import PdfReader
+    except Exception:
+        return ""
+
+    try:
+        reader = PdfReader(BytesIO(pdf_bytes))
+        page_texts = [
+            page.extract_text() or ""
+            for page in reader.pages
+        ]
+    except Exception:
+        return ""
+
+    return "\n\n".join(text.strip() for text in page_texts if text.strip()).strip()

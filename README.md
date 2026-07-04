@@ -13,6 +13,8 @@ cd backend
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+python -m spacy download en_core_web_sm
+python -m nltk.downloader -d .venv/nltk_data brown
 ```
 
 ### 2. 環境変数
@@ -28,6 +30,9 @@ cp .env.example .env
 | `SUPABASE_URL` | SupabaseプロジェクトのURL |
 | `SUPABASE_SERVICE_ROLE_KEY` | サービスロールキー（Settings → API） |
 | `GOOGLE_APPLICATION_CREDENTIALS` | GCPサービスアカウントJSONのパス |
+| `GEMINI_API_KEY` | 日本語語義生成に使う Gemini API キー |
+| `GEMINI_MODEL` | Gemini の日本語語義生成モデル（既定: `gemini-2.5-flash`） |
+| `WIKTIONARY_USER_AGENT` | Wiktionary MediaWiki API 用 User-Agent |
 
 ### 3. Supabase テーブル作成
 
@@ -49,7 +54,7 @@ uvicorn app.main:app --reload
 |--------|------|------|
 | `POST` | `/api/v1/ocr/image` | 画像→テキスト（Google Vision） |
 | `POST` | `/api/v1/ocr/pdf` | PDF→テキスト（Google Vision） |
-| `POST` | `/api/v1/words/extract` | テキストから未知単語を抽出 |
+| `POST` | `/api/v1/words/extract` | テキストから品詞つき未知語・英熟語を抽出し、カバー率を返す |
 | `GET`  | `/api/v1/words/{user_id}` | 単語帳取得（?is_learned=true/false） |
 | `POST` | `/api/v1/words/` | 単語を1件追加 |
 | `POST` | `/api/v1/words/batch` | 未知単語を一括追加 |
@@ -67,7 +72,7 @@ uvicorn app.main:app --reload
     ↓
 POST /ocr/image  →  { text: "..." }
     ↓
-POST /words/extract  →  { unknown_words: [...] }
+POST /words/extract  →  { unknown_words: [...], unknown_items: [...], coverage_rate: 0.72 }
     ↓
 POST /words/batch   →  単語帳に一括登録
     ↓
