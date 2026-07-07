@@ -12,6 +12,7 @@ CEFR-J Wordlist seed スクリプト
 import csv
 import os
 import time
+from typing import Optional
 from dotenv import load_dotenv
 from supabase import create_client
 
@@ -52,7 +53,7 @@ POS_MAP = {
 }
 
 
-def normalize_pos(pos: str) -> str | None:
+def normalize_pos(pos: str) -> Optional[str]:
     return POS_MAP.get(pos.lower().strip())
 
 
@@ -94,13 +95,13 @@ def main():
         for i, row in enumerate(rows):
             headword  = row["headword"].strip().lower()
             pos_raw   = row["pos"].strip()
-            definition = row["meaning_ja"].strip()
+            definition_ja = row["meaning_ja"].strip()
             ipa       = row.get("ipa", "").strip() or None
             example   = row.get("example_sentence", "").strip()
             translated = row.get("translated_sentence", "").strip()
 
             pos = normalize_pos(pos_raw)
-            if not headword or not pos or not definition:
+            if not headword or not pos or not definition_ja:
                 skipped += 1
                 continue
 
@@ -123,18 +124,18 @@ def main():
 
             # meanings
             meaning_res = upsert_with_retry(
-                lambda wid=word_id, p=pos, d=definition, ip=ipa, t=tier: (
+                lambda wid=word_id, p=pos, d=definition_ja, ip=ipa, t=tier: (
                     db.table("meanings").upsert(
                         {
                             "word_id": wid,
                             "part_of_speech": p,
-                            "definition": d,
+                            "definition_en": None,
                             "definition_ja": d,
                             "ipa": ip,
                             "source": "cefr_j",
                             "tier": t,
                         },
-                        on_conflict="word_id,part_of_speech,definition"
+                        on_conflict="word_id,part_of_speech,definition_ja"
                     ).execute()
                 )
             )
@@ -143,18 +144,29 @@ def main():
 
             # example_sentences
             if example:
-                upsert_with_retry(
-                    lambda mid=meaning_id, s=example, ts=translated: (
-                        db.table("example_sentences").insert(
-                            {
-                                "meaning_id": mid,
-                                "sentence": s,
-                                "translated_sentence": ts or None,
-                            }
-                        ).execute()
+                existing_example = upsert_with_retry(
+                    lambda mid=meaning_id, s=example: (
+                        db.table("example_sentences")
+                        .select("id")
+                        .eq("meaning_id", mid)
+                        .eq("sentence", s)
+                        .limit(1)
+                        .execute()
                     )
                 )
-                total_examples += 1
+                if not existing_example.data:
+                    upsert_with_retry(
+                        lambda mid=meaning_id, s=example, ts=translated: (
+                            db.table("example_sentences").insert(
+                                {
+                                    "meaning_id": mid,
+                                    "sentence": s,
+                                    "translated_sentence": ts or None,
+                                }
+                            ).execute()
+                        )
+                    )
+                    total_examples += 1
 
         print(f"  {len(rows)}/{len(rows)}件... 完了")
 

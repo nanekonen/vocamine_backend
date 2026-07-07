@@ -1,4 +1,5 @@
 from __future__ import annotations
+import asyncio
 import csv
 import re
 from functools import lru_cache
@@ -11,7 +12,12 @@ from spacy.util import filter_spans
 
 from app.db.supabase import get_supabase
 from app.schemas.schemas import PartOfSpeech
-from app.services.word_lookup_service import get_or_create_word
+from app.services.word_lookup_service import (
+    batch_generate_missing_japanese_definitions,
+    ensure_meanings_for_word,
+    get_or_create_word,
+    record_wordbook_source,
+)
 
 # ユーザーレベル → CEFR-J tier の上限マッピング
 LEVEL_TIER_MAP: dict[str, int] = {
@@ -32,6 +38,49 @@ LEVEL_TIER_MAP: dict[str, int] = {
 PHRASE_LIST_DIR = Path(__file__).resolve().parents[2] / "phrase_list"
 ACL_FILENAME = "The_Academic_Collocation_List(Academic Collocation List).csv"
 TRAILING_POS_RE = re.compile(r"\s*\((?:adj|adv|n|v|vpp)\)\s*$", re.IGNORECASE)
+ENGLISH_WORD_RE = re.compile(r"^[a-z]+(?:['’-][a-z]+)*$", re.IGNORECASE)
+NON_WORD_TEXTS = {
+    "http",
+    "https",
+    "www",
+    "com",
+    "org",
+    "net",
+    "pdf",
+}
+ARTICLE_WORDS = {"a", "an", "the"}
+DEMONSTRATIVE_WORDS = {"this", "that", "these", "those"}
+POSSESSIVE_DETERMINER_WORDS = {
+    "my",
+    "your",
+    "his",
+    "her",
+    "its",
+    "our",
+    "their",
+    "whose",
+}
+QUANTIFIER_WORDS = {
+    "all",
+    "any",
+    "both",
+    "each",
+    "either",
+    "enough",
+    "every",
+    "few",
+    "fewer",
+    "less",
+    "little",
+    "many",
+    "more",
+    "most",
+    "much",
+    "neither",
+    "no",
+    "several",
+    "some",
+}
 
 
 @lru_cache(maxsize=1)
@@ -116,67 +165,153 @@ def _normalize_lemma(token) -> str:
     return lemma
 
 
-def _map_spacy_pos(token) -> Optional[str]:
-    pos = token.pos_
-    if pos in {"NOUN", "PROPN"}:
-        return PartOfSpeech.noun.value
-    if pos in {"VERB", "AUX"}:
-        return PartOfSpeech.verb.value
-    if pos == "ADJ":
-        return PartOfSpeech.adjective.value
-    if pos == "ADV":
-        return PartOfSpeech.adverb.value
-    if pos == "PRON":
-        return PartOfSpeech.pronoun.value
-    if pos == "ADP":
-        return PartOfSpeech.preposition.value
-    if pos in {"CCONJ", "SCONJ"}:
-        return PartOfSpeech.conjunction.value
-    if pos == "INTJ":
-        return PartOfSpeech.interjection.value
-    if pos == "DET":
-        return PartOfSpeech.determiner.value
-    if pos == "NUM":
-        return PartOfSpeech.numeral.value
-    if pos == "PART":
-        return PartOfSpeech.preposition.value
-    if pos == "X":
-        return PartOfSpeech.abbreviation.value
+def _is_english_word_text(value: str) -> bool:
+    return bool(ENGLISH_WORD_RE.fullmatch(value.strip()))
 
+
+def _is_english_phrase_text(value: str) -> bool:
+    words = _normalize_phrase_text(value).split()
+    return len(words) > 1 and all(_is_english_word_text(word) for word in words)
+
+
+def _is_valid_single_letter_word_token(token) -> bool:
+    text = token.text
+    if len(text) != 1:
+        return True
+    if text.lower() == "a":
+        return token.pos_ == "DET" or token.tag_ == "DT"
+    if text == "I":
+        return token.pos_ == "PRON" or token.tag_ == "PRP"
+    return False
+
+
+def _is_valid_word_token(token) -> bool:
+    if not token.is_alpha or not token.is_ascii:
+        return False
+    if token.text.lower() in NON_WORD_TEXTS:
+        return False
+    if not _is_valid_single_letter_word_token(token):
+        return False
+    return _is_english_word_text(token.text)
+
+
+def _determiner_detail(token) -> Optional[str]:
+    text = token.text.lower()
     tag = token.tag_
-    if tag.startswith("NN"):
-        return PartOfSpeech.noun.value
-    if tag.startswith("VB"):
-        return PartOfSpeech.verb.value
-    if tag.startswith("JJ"):
-        return PartOfSpeech.adjective.value
-    if tag.startswith("RB"):
-        return PartOfSpeech.adverb.value
-    if tag in {"PRP", "PRP$"}:
-        return PartOfSpeech.pronoun.value
-    if tag in {"IN", "TO"}:
-        return PartOfSpeech.preposition.value
-    if tag == "CC":
-        return PartOfSpeech.conjunction.value
-    if tag == "UH":
-        return PartOfSpeech.interjection.value
-    if tag in {"DT", "PDT", "WDT"}:
-        return PartOfSpeech.determiner.value
-    if tag == "CD":
-        return PartOfSpeech.numeral.value
-    if tag in {"FW", "SYM"}:
-        return PartOfSpeech.abbreviation.value
+    if tag == "CD" or token.pos_ == "NUM":
+        return "numeral"
+    if text in ARTICLE_WORDS:
+        return "article"
+    if text in DEMONSTRATIVE_WORDS:
+        return "demonstrative"
+    if text in POSSESSIVE_DETERMINER_WORDS or tag == "PRP$":
+        return "possessive_determiner"
+    if text in QUANTIFIER_WORDS:
+        return "quantifier"
     return None
 
 
+def _auxiliary_detail(token) -> Optional[str]:
+    if token.pos_ != "AUX" and token.dep_ not in {"aux", "auxpass"}:
+        return None
+    if token.tag_ == "MD":
+        return "modal_auxiliary"
+    if token.dep_ in {"aux", "auxpass"}:
+        return "auxiliary"
+    if token.lemma_.lower() == "be":
+        return "copula"
+    return "auxiliary"
+
+
+def _map_spacy_pos(token) -> tuple[Optional[str], Optional[str]]:
+    aux_detail = _auxiliary_detail(token)
+    if aux_detail:
+        return PartOfSpeech.auxiliary.value, aux_detail
+
+    detail = _determiner_detail(token)
+    if detail == "article":
+        return PartOfSpeech.article.value, detail
+    if detail:
+        return PartOfSpeech.determiner.value, detail
+
+    if token.text.lower() == "such":
+        return PartOfSpeech.determiner.value, "demonstrative"
+
+    pos = token.pos_
+    if pos in {"NOUN", "PROPN"}:
+        return PartOfSpeech.noun.value, None
+    if pos in {"VERB", "AUX"}:
+        return PartOfSpeech.verb.value, None
+    if pos == "ADJ":
+        return PartOfSpeech.adjective.value, None
+    if pos == "ADV":
+        return PartOfSpeech.adverb.value, None
+    if pos == "PRON":
+        return PartOfSpeech.pronoun.value, None
+    if pos == "ADP":
+        return PartOfSpeech.preposition.value, None
+    if pos in {"CCONJ", "SCONJ"}:
+        return PartOfSpeech.conjunction.value, None
+    if pos == "INTJ":
+        return PartOfSpeech.interjection.value, None
+    if pos == "DET":
+        return PartOfSpeech.determiner.value, None
+    if pos == "NUM":
+        return PartOfSpeech.determiner.value, "numeral"
+    if pos == "PART":
+        return PartOfSpeech.preposition.value, None
+    if pos == "X":
+        return PartOfSpeech.abbreviation.value, None
+
+    tag = token.tag_
+    if tag.startswith("NN"):
+        return PartOfSpeech.noun.value, None
+    if tag.startswith("VB"):
+        return PartOfSpeech.verb.value, None
+    if tag.startswith("JJ"):
+        return PartOfSpeech.adjective.value, None
+    if tag.startswith("RB"):
+        return PartOfSpeech.adverb.value, None
+    if tag in {"PRP", "PRP$"}:
+        return PartOfSpeech.pronoun.value, None
+    if tag in {"IN", "TO"}:
+        return PartOfSpeech.preposition.value, None
+    if tag == "CC":
+        return PartOfSpeech.conjunction.value, None
+    if tag == "UH":
+        return PartOfSpeech.interjection.value, None
+    if tag in {"DT", "PDT", "WDT"}:
+        return PartOfSpeech.determiner.value, None
+    if tag == "CD":
+        return PartOfSpeech.determiner.value, "numeral"
+    if tag in {"FW", "SYM"}:
+        return PartOfSpeech.abbreviation.value, None
+    return None, None
+
+
 def _dedupe_items(items: list[dict]) -> list[dict]:
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, Optional[str]]] = set()
     result: list[dict] = []
     for item in items:
-        key = (item["text"], item["part_of_speech"])
-        if key not in seen:
-            seen.add(key)
-            result.append(item)
+        key = (item["text"], item["part_of_speech"], item.get("part_of_speech_detail"))
+        if key in seen:
+            for existing in result:
+                if (
+                    existing["text"],
+                    existing["part_of_speech"],
+                    existing.get("part_of_speech_detail"),
+                ) == key:
+                    existing["occurrence_count"] = existing.get("occurrence_count", 1) + item.get("occurrence_count", 1)
+                    existing_forms = existing.setdefault("surface_forms", [])
+                    for form in item.get("surface_forms") or []:
+                        if form not in existing_forms:
+                            existing_forms.append(form)
+                    existing_occurrences = existing.setdefault("occurrences", [])
+                    existing_occurrences.extend(item.get("occurrences") or [])
+                    break
+            continue
+        seen.add(key)
+        result.append(item)
     return result
 
 
@@ -199,34 +334,6 @@ async def get_learned_lexical_items(user_id: str) -> set[tuple[str, str]]:
     return learned
 
 
-def _lookup_existing_pos_map(words: list[str]) -> dict[str, list[str]]:
-    if not words:
-        return {}
-    try:
-        db = get_supabase()
-        response = (
-            db.table("words")
-            .select("word, meanings(part_of_speech)")
-            .in_("word", words)
-            .execute()
-        )
-    except Exception:
-        return {}
-    pos_map: dict[str, list[str]] = {}
-    for row in (response.data or []):
-        word = row.get("word")
-        if not word:
-            continue
-        poses = [
-            m.get("part_of_speech")
-            for m in (row.get("meanings") or [])
-            if m.get("part_of_speech")
-        ]
-        if poses:
-            pos_map[word.lower()] = poses
-    return pos_map
-
-
 def _phrase_catalog() -> list[str]:
     phrases = set(_load_phrase_list_phrases())
     try:
@@ -246,7 +353,7 @@ def _phrase_catalog() -> list[str]:
     return sorted(phrases, key=lambda p: len(p.split()), reverse=True)
 
 
-def analyze_lexical_items(text: str) -> list[dict]:
+async def analyze_lexical_items(text: str) -> list[dict]:
     nlp = _get_spacy_nlp()
     doc = nlp(text)
     if not doc:
@@ -254,37 +361,55 @@ def analyze_lexical_items(text: str) -> list[dict]:
 
     phrase_texts = _phrase_catalog()
     items: list[dict] = []
-    consumed_indexes: set[int] = set()
 
     if phrase_texts:
         matcher = PhraseMatcher(nlp.vocab, attr="LOWER")
-        matcher.add("WIKTIONARY_PHRASES", [nlp.make_doc(phrase) for phrase in phrase_texts])
+        matcher.add(
+            "WIKTIONARY_PHRASES",
+            [nlp.make_doc(phrase) for phrase in phrase_texts if _is_english_phrase_text(phrase)],
+        )
         spans = filter_spans([doc[start:end] for _, start, end in matcher(doc)])
         for span in spans:
-            consumed_indexes.update(range(span.start, span.end))
             items.append({
                 "text": span.text.lower(),
                 "part_of_speech": PartOfSpeech.phrase.value,
+                "part_of_speech_detail": None,
+                "surface_forms": [span.text.lower()],
+                "occurrences": [{
+                    "form": span.text.lower(),
+                    "start": span.start_char,
+                    "end": span.end_char,
+                }],
                 "kind": "phrase",
+                "occurrence_count": 1,
             })
 
     remaining_tokens = [
         token for token in doc
-        if token.i not in consumed_indexes and (token.is_alpha or token.like_num)
+        if _is_valid_word_token(token)
     ]
-    pos_map = _lookup_existing_pos_map(list(dict.fromkeys(_normalize_lemma(token) for token in remaining_tokens)))
+    candidate_items: list[dict] = []
     for token in remaining_tokens:
         lemma = _normalize_lemma(token)
-        pos = _map_spacy_pos(token)
-        if not lemma or not pos:
+        pos, pos_detail = _map_spacy_pos(token)
+        if not lemma or not pos or not _is_english_word_text(lemma):
             continue
-        if lemma in pos_map:
-            pos = pos_map[lemma][0]
-        items.append({
+        candidate_items.append({
             "text": lemma,
             "part_of_speech": pos,
+            "part_of_speech_detail": pos_detail,
+            "surface_forms": [token.text.lower()],
+            "occurrences": [{
+                "form": token.text.lower(),
+                "start": token.idx,
+                "end": token.idx + len(token.text),
+            }],
             "kind": "word",
+            "occurrence_count": 1,
         })
+
+    for item in candidate_items:
+        items.append(item)
 
     return _dedupe_items(items)
 
@@ -294,7 +419,7 @@ async def extract_unknown_words(text: str, user_id: str, enrich_meanings: bool =
     テキスト中の英単語のうち、学習済み単語帳に存在しないものを返す。
     判定: wordbook_words に is_learned=true のエントリーがない単語 = 未知
     """
-    lexical_items = analyze_lexical_items(text)
+    lexical_items = await analyze_lexical_items(text)
     total = len(lexical_items)
 
     if total == 0:
@@ -333,13 +458,14 @@ async def extract_unknown_words(text: str, user_id: str, enrich_meanings: bool =
         if not is_learned:
             unknown_items.append(result)
 
-    known_count = total - len(unknown_items)
+    unknown_count = len(unknown_items)
+    known_count = total - unknown_count
     coverage_rate = round(known_count / total, 4) if total else 0.0
 
     return {
         "unknown_words": [item["text"] for item in unknown_items],
         "total_words": total,
-        "unknown_count": len(unknown_items),
+        "unknown_count": unknown_count,
         "known_count": known_count,
         "coverage_rate": coverage_rate,
         "items": item_results,
@@ -363,13 +489,21 @@ async def enrich_lexical_items(items: list[dict]) -> None:
             continue
         seen.add(key)
         try:
-            await get_or_create_word(
+            lookup = await get_or_create_word(
                 text,
                 part_of_speech=part_of_speech,
-                enrich_meanings=True,
+                enrich_meanings=False,
+            )
+            await ensure_meanings_for_word(
+                lookup["word_id"],
+                text,
+                part_of_speech=part_of_speech,
+                generate_japanese=False,
+                allow_fallback_generation=False,
             )
         except Exception:
             continue
+    await batch_generate_missing_japanese_definitions(items)
 
 
 async def bulk_register_cefr_words(user_id: str, level: str) -> int:
@@ -403,5 +537,11 @@ async def bulk_register_cefr_words(user_id: str, level: str) -> int:
         for m in meanings.data
     ]
 
-    db.table("wordbook_words").upsert(rows, on_conflict="user_id,meaning_id").execute()
+    response = db.table("wordbook_words").upsert(rows, on_conflict="user_id,meaning_id").execute()
+    for row in response.data or []:
+        record_wordbook_source(
+            row["id"],
+            source_type="initial_level",
+            source_label=level,
+        )
     return len(rows)

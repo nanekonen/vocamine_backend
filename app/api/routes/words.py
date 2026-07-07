@@ -13,8 +13,10 @@ from app.services.word_lookup_service import (
     get_or_create_word,
     get_word_with_meanings,
     add_meanings_to_wordbook,
+    record_wordbook_source,
 )
 from app.services.dictionary_service import normalize_part_of_speech
+from app.services.user_identity_service import resolve_user_id
 
 router = APIRouter(prefix="/words", tags=["Words"])
 
@@ -36,6 +38,7 @@ async def add_word(word: str):
 async def lookup_word(
     word: str = Query(..., min_length=1),
     part_of_speech: Optional[str] = Query(default=None),
+    enrich_meanings: bool = Query(default=True),
 ):
     """
     単語・熟語と品詞から meanings を取得する。
@@ -45,18 +48,11 @@ async def lookup_word(
         lookup = await get_or_create_word(
             word,
             part_of_speech=part_of_speech,
-            enrich_meanings=True,
+            enrich_meanings=enrich_meanings,
         )
         result = get_word_with_meanings(lookup["word_id"])
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Word lookup failed: {e}") from e
-    normalized_pos = normalize_part_of_speech(part_of_speech)
-    if normalized_pos:
-        result["meanings"] = [
-            meaning
-            for meaning in result.get("meanings", [])
-            if meaning.get("part_of_speech") == normalized_pos
-        ]
     return result
 
 
@@ -80,6 +76,7 @@ async def add_words_batch(payload: BatchWordsRequest):
     意味がまだ登録されていない単語も results に含め、呼び出し側で判断できるようにする。
     """
     results: list[BatchWordResult] = []
+    user_id = resolve_user_id(payload.user_id)
     registered_count = 0
     skipped_no_meaning_count = 0
 
@@ -123,9 +120,13 @@ async def add_words_batch(payload: BatchWordsRequest):
             continue
 
         added_ids = await add_meanings_to_wordbook(
-            payload.user_id,
+            user_id,
             lookup["word_id"],
             part_of_speech=part_of_speech,
+            source_type=payload.source_type,
+            source_material_id=payload.source_material_id,
+            source_folder_id=payload.source_folder_id,
+            source_label=payload.source_label,
         )
         registered_count += 1
         results.append(BatchWordResult(
@@ -149,25 +150,59 @@ async def add_words_batch(payload: BatchWordsRequest):
 async def get_wordbook(
     user_id: str,
     is_learned: Optional[bool] = Query(default=None),
+    source_type: Optional[str] = Query(default=None),
+    source_material_id: Optional[str] = Query(default=None),
+    source_folder_id: Optional[str] = Query(default=None),
 ):
     """ユーザーの単語帳を取得（is_learnedでフィルタ可能）"""
+    user_id = resolve_user_id(user_id)
     db = get_supabase()
-    query = (
-        db.table("wordbook_words")
-        .select("*, meanings(*, words(*), example_sentences(*))")
-        .eq("user_id", user_id)
-    )
-    if is_learned is not None:
-        query = query.eq("is_learned", is_learned)
-    response = query.order("created_at", desc=True).execute()
-    return response.data or []
+    def build_query(include_sources: bool):
+        select = "*, meanings(*, words(*), example_sentences(*))"
+        if include_sources:
+            select += ", wordbook_word_sources(*)"
+        query = db.table("wordbook_words").select(select).eq("user_id", user_id)
+        if is_learned is not None:
+            query = query.eq("is_learned", is_learned)
+        return query.order("created_at", desc=True)
+
+    include_sources = True
+    try:
+        response = build_query(include_sources=True).execute()
+    except Exception:
+        include_sources = False
+        response = build_query(include_sources=False).execute()
+    rows = []
+    for row in response.data or []:
+        sources = row.pop("wordbook_word_sources", []) or []
+        if not include_sources and (source_type or source_material_id or source_folder_id):
+            continue
+        if source_type and not any(source.get("source_type") == source_type for source in sources):
+            continue
+        if source_material_id and not any(source.get("material_id") == source_material_id for source in sources):
+            continue
+        if source_folder_id and not any(source.get("folder_id") == source_folder_id for source in sources):
+            continue
+        row["sources"] = sources
+        rows.append(row)
+    return rows
 
 
 @router.post("/wordbook", response_model=WordbookWordResponse, status_code=201)
 async def add_to_wordbook(user_id: str, payload: WordbookWordCreate):
     """meaning_idを単語帳（未学習）に追加する"""
+    user_id = resolve_user_id(user_id)
     db = get_supabase()
     try:
+        meaning = (
+            db.table("meanings")
+            .select("id")
+            .eq("id", payload.meaning_id)
+            .maybe_single()
+            .execute()
+        )
+        if not meaning.data:
+            raise HTTPException(status_code=404, detail="Meaning not found.")
         existing = (
             db.table("wordbook_words")
             .select("id")
@@ -176,12 +211,32 @@ async def add_to_wordbook(user_id: str, payload: WordbookWordCreate):
             .execute()
         )
         if existing.data:
-            raise HTTPException(status_code=409, detail="Already in wordbook.")
+            updated = (
+                db.table("wordbook_words")
+                .update({"is_learned": False})
+                .eq("id", existing.data[0]["id"])
+                .execute()
+            )
+            record_wordbook_source(
+                existing.data[0]["id"],
+                source_type=payload.source_type,
+                source_material_id=payload.source_material_id,
+                source_folder_id=payload.source_folder_id,
+                source_label=payload.source_label,
+            )
+            return updated.data[0] if updated.data else existing.data[0]
         response = db.table("wordbook_words").insert({
             "user_id": user_id,
             "meaning_id": payload.meaning_id,
             "is_learned": False,
         }).execute()
+        record_wordbook_source(
+            response.data[0]["id"],
+            source_type=payload.source_type,
+            source_material_id=payload.source_material_id,
+            source_folder_id=payload.source_folder_id,
+            source_label=payload.source_label,
+        )
         return response.data[0]
     except HTTPException:
         raise
@@ -222,7 +277,7 @@ async def extract_words(payload: ExtractWordsRequest, background_tasks: Backgrou
     """
     result = await extract_unknown_words(
         text=payload.text,
-        user_id=payload.user_id,
+        user_id=resolve_user_id(payload.user_id),
         enrich_meanings=payload.enrich_meanings,
     )
     if payload.background_enrich_meanings and not payload.enrich_meanings:

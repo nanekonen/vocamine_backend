@@ -17,6 +17,7 @@ class PartOfSpeech(str, Enum):
     interjection = "interjection"
     determiner = "determiner"
     article = "article"
+    auxiliary = "auxiliary"
     numeral = "numeral"
     prefix = "prefix"
     suffix = "suffix"
@@ -26,7 +27,12 @@ class PartOfSpeech(str, Enum):
 
 class DictionarySource(str, Enum):
     wiktionary = "wiktionary"
+    grammar = "grammar"
+    gemini = "gemini"
     cefr_j = "cefr_j"
+    phave_list = "phave_list"
+    phrase_list = "phrase_list"
+    academic_collocation_list = "academic_collocation_list"
     collins = "collins"
     cambridge = "cambridge"
     oxford = "oxford"
@@ -46,8 +52,72 @@ class CountabilityType(str, Enum):
 
 
 # --- OCR ---
+class OCRWordBox(BaseModel):
+    text: str
+    page_index: int = 0
+    start: Optional[int] = None
+    end: Optional[int] = None
+    left: float
+    top: float
+    width: float
+    height: float
+
+
 class OCRResponse(BaseModel):
     text: str
+    word_boxes: list[OCRWordBox] = Field(default_factory=list)
+
+
+class PDFOCRResponse(OCRResponse):
+    page_images: list[str] = Field(default_factory=list)
+
+
+# --- Materials ---
+class MaterialFolderCreate(BaseModel):
+    user_id: str
+    name: str
+    parent_id: Optional[str] = None
+
+
+class MaterialFolderResponse(BaseModel):
+    id: str
+    user_id: str
+    name: str
+    parent_id: Optional[str] = None
+    created_at: datetime
+
+
+class MaterialCreate(BaseModel):
+    user_id: str
+    title: str
+    extracted_text: str = ""
+    ocr_text: str = ""
+    folder_id: Optional[str] = None
+    source_mime_type: Optional[str] = None
+    source_base64: Optional[str] = None
+    readable_pdf_base64: Optional[str] = None
+    page_images_base64: list[str] = Field(default_factory=list)
+    word_boxes: list[OCRWordBox] = Field(default_factory=list)
+
+
+class MaterialResponse(BaseModel):
+    id: str
+    user_id: str
+    folder_id: Optional[str] = None
+    title: str
+    extracted_text: str = ""
+    source_mime_type: Optional[str] = None
+    source_object_storage_key: Optional[str] = None
+    readable_pdf_object_storage_key: Optional[str] = None
+    thumbnail_object_storage_key: Optional[str] = None
+    page_images: list[str] = Field(default_factory=list)
+    word_boxes: list[OCRWordBox] = Field(default_factory=list)
+    created_at: datetime
+
+
+class MaterialLibraryResponse(BaseModel):
+    folders: list[MaterialFolderResponse] = Field(default_factory=list)
+    materials: list[MaterialResponse] = Field(default_factory=list)
 
 
 # --- Example Sentence ---
@@ -63,7 +133,7 @@ class MeaningResponse(BaseModel):
     id: int
     word_id: int
     part_of_speech: PartOfSpeech
-    definition: str
+    definition_en: Optional[str] = None
     definition_ja: Optional[str] = None
     ipa: Optional[str] = None
     transitivity: Optional[TransitivityType] = None
@@ -76,7 +146,7 @@ class MeaningResponse(BaseModel):
 
 class MeaningCreate(BaseModel):
     part_of_speech: PartOfSpeech
-    definition: str
+    definition_en: Optional[str] = None
     definition_ja: Optional[str] = None
     ipa: Optional[str] = None
     transitivity: Optional[TransitivityType] = None
@@ -102,10 +172,15 @@ class WordbookWordResponse(BaseModel):
     is_learned: bool
     created_at: datetime
     meaning: Optional[MeaningResponse] = Field(default=None, validation_alias="meanings")
+    sources: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class WordbookWordCreate(BaseModel):
     meaning_id: int
+    source_type: str = "manual"
+    source_material_id: Optional[str] = None
+    source_folder_id: Optional[str] = None
+    source_label: Optional[str] = None
 
 
 class WordbookWordUpdate(BaseModel):
@@ -116,12 +191,16 @@ class WordbookWordUpdate(BaseModel):
 class LexicalItem(BaseModel):
     text: str
     part_of_speech: PartOfSpeech
+    part_of_speech_detail: Optional[str] = None
+    surface_forms: list[str] = Field(default_factory=list)
+    occurrences: list[dict[str, Any]] = Field(default_factory=list)
     kind: str = "word"  # "word" | "phrase"
 
 
 class LexicalItemResult(LexicalItem):
     is_learned: bool
     has_meaning: bool = False
+    occurrence_count: int = 1
 
 
 class ExtractWordsRequest(BaseModel):
@@ -147,6 +226,10 @@ class BatchWordsRequest(BaseModel):
     words: list[str] = Field(default_factory=list)
     items: list[LexicalItem] = Field(default_factory=list)
     enrich_meanings: bool = True
+    source_type: str = "manual"
+    source_material_id: Optional[str] = None
+    source_folder_id: Optional[str] = None
+    source_label: Optional[str] = None
 
 
 class BatchWordResult(BaseModel):
@@ -178,3 +261,14 @@ class UserResponse(BaseModel):
 # --- Level setup ---
 class LevelSetupRequest(BaseModel):
     level: str
+
+
+# --- Auth ---
+class AuthSessionRequest(BaseModel):
+    access_token: str
+
+
+class AuthSessionResponse(BaseModel):
+    user_id: str
+    email: Optional[str] = None
+    setup_completed: bool = False

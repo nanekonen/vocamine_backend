@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
-from app.api.routes import ocr, words, users
+from app.api.routes import auth, materials, ocr, words, users
 
 app = FastAPI(
     title="Vocamine API",
@@ -11,7 +11,10 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
+    allow_origins=list(set(settings.cors_origins + [
+        "http://127.0.0.1:3000",
+        "http://localhost:3000",
+    ])),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -20,6 +23,8 @@ app.add_middleware(
 app.include_router(ocr.router, prefix="/api/v1")
 app.include_router(words.router, prefix="/api/v1")
 app.include_router(users.router, prefix="/api/v1")
+app.include_router(auth.router, prefix="/api/v1")
+app.include_router(materials.router, prefix="/api/v1")
 
 
 @app.get("/health")

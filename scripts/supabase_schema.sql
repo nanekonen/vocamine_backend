@@ -8,7 +8,12 @@
 
 CREATE TYPE dictionary_source AS ENUM (
     'wiktionary',
+    'grammar',
+    'gemini',
     'cefr_j',
+    'phave_list',
+    'phrase_list',
+    'academic_collocation_list',
     'collins',
     'cambridge',
     'oxford',
@@ -26,6 +31,7 @@ CREATE TYPE part_of_speech AS ENUM (
     'interjection',
     'determiner',
     'article',
+    'auxiliary',
     'numeral',
     'prefix',
     'suffix',
@@ -73,7 +79,7 @@ CREATE TABLE IF NOT EXISTS meanings (
     id               BIGSERIAL PRIMARY KEY,
     word_id          BIGINT NOT NULL REFERENCES words(id) ON DELETE CASCADE,
     part_of_speech   part_of_speech NOT NULL,
-    definition       TEXT NOT NULL,
+    definition_en    TEXT,
     ipa              TEXT,
     transitivity     transitivity_type,
     countability     countability_type,
@@ -88,7 +94,10 @@ CREATE INDEX IF NOT EXISTS meanings_tier_idx    ON meanings(tier);
 CREATE INDEX IF NOT EXISTS meanings_source_idx  ON meanings(source);
 
 CREATE UNIQUE INDEX IF NOT EXISTS meanings_unique_idx
-ON meanings(word_id, part_of_speech, definition);
+ON meanings(word_id, part_of_speech, definition_en);
+
+CREATE UNIQUE INDEX IF NOT EXISTS meanings_unique_ja_idx
+ON meanings(word_id, part_of_speech, definition_ja);
 
 -- ============================================================
 -- Example sentences (1 meaning : N examples)
@@ -103,6 +112,43 @@ CREATE TABLE IF NOT EXISTS example_sentences (
 
 CREATE INDEX IF NOT EXISTS example_sentences_meaning_idx
 ON example_sentences(meaning_id);
+
+-- ============================================================
+-- Materials
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS material_folders (
+    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id    UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    parent_id  UUID REFERENCES material_folders(id) ON DELETE CASCADE,
+    name       TEXT NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS material_folders_user_id_idx
+ON material_folders(user_id);
+
+CREATE INDEX IF NOT EXISTS material_folders_parent_id_idx
+ON material_folders(parent_id);
+
+CREATE TABLE IF NOT EXISTS materials (
+    id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id             UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    folder_id           UUID REFERENCES material_folders(id) ON DELETE SET NULL,
+    title               TEXT NOT NULL,
+    ocr_text            TEXT NOT NULL DEFAULT '',
+    source_mime_type    TEXT,
+    source_object_storage_key       TEXT,
+    page_images_object_storage_keys JSONB NOT NULL DEFAULT '[]'::jsonb,
+    source_word_boxes   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at          TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS materials_user_id_idx
+ON materials(user_id);
+
+CREATE INDEX IF NOT EXISTS materials_folder_id_idx
+ON materials(folder_id);
 
 -- ============================================================
 -- Wordbook
@@ -120,12 +166,43 @@ CREATE TABLE IF NOT EXISTS wordbook_words (
 CREATE INDEX IF NOT EXISTS wordbook_words_user_id_idx      ON wordbook_words(user_id);
 CREATE INDEX IF NOT EXISTS wordbook_words_user_learned_idx ON wordbook_words(user_id, is_learned);
 
+CREATE TABLE IF NOT EXISTS wordbook_word_sources (
+    id               BIGSERIAL PRIMARY KEY,
+    wordbook_word_id BIGINT NOT NULL REFERENCES wordbook_words(id) ON DELETE CASCADE,
+    source_type      TEXT NOT NULL DEFAULT 'manual',
+    material_id      UUID REFERENCES materials(id) ON DELETE SET NULL,
+    folder_id        UUID REFERENCES material_folders(id) ON DELETE SET NULL,
+    label            TEXT,
+    created_at       TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS wordbook_word_sources_unique_idx
+ON wordbook_word_sources (
+    wordbook_word_id,
+    source_type,
+    COALESCE(material_id, '00000000-0000-0000-0000-000000000000'::uuid),
+    COALESCE(folder_id, '00000000-0000-0000-0000-000000000000'::uuid),
+    COALESCE(label, '')
+);
+
+CREATE INDEX IF NOT EXISTS wordbook_word_sources_wordbook_word_id_idx
+ON wordbook_word_sources(wordbook_word_id);
+
+CREATE INDEX IF NOT EXISTS wordbook_word_sources_material_id_idx
+ON wordbook_word_sources(material_id);
+
+CREATE INDEX IF NOT EXISTS wordbook_word_sources_folder_id_idx
+ON wordbook_word_sources(folder_id);
+
 -- ============================================================
 -- Row Level Security
 -- ============================================================
 
 ALTER TABLE users          ENABLE ROW LEVEL SECURITY;
 ALTER TABLE wordbook_words ENABLE ROW LEVEL SECURITY;
+ALTER TABLE material_folders ENABLE ROW LEVEL SECURITY;
+ALTER TABLE materials ENABLE ROW LEVEL SECURITY;
+ALTER TABLE wordbook_word_sources ENABLE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS "own profile" ON users;
 CREATE POLICY "own profile"
@@ -138,6 +215,36 @@ CREATE POLICY "own wordbook"
     ON wordbook_words FOR ALL
     USING (auth.uid() = user_id)
     WITH CHECK (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "own material folders" ON material_folders;
+CREATE POLICY "own material folders"
+    ON material_folders FOR ALL
+    USING (auth.uid() = user_id)
+    WITH CHECK (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "own materials" ON materials;
+CREATE POLICY "own materials"
+    ON materials FOR ALL
+    USING (auth.uid() = user_id)
+    WITH CHECK (auth.uid() = user_id);
+
+DROP POLICY IF EXISTS "own wordbook sources" ON wordbook_word_sources;
+CREATE POLICY "own wordbook sources"
+    ON wordbook_word_sources FOR ALL
+    USING (
+        EXISTS (
+            SELECT 1 FROM wordbook_words
+            WHERE wordbook_words.id = wordbook_word_sources.wordbook_word_id
+              AND wordbook_words.user_id = auth.uid()
+        )
+    )
+    WITH CHECK (
+        EXISTS (
+            SELECT 1 FROM wordbook_words
+            WHERE wordbook_words.id = wordbook_word_sources.wordbook_word_id
+              AND wordbook_words.user_id = auth.uid()
+        )
+    );
 
 -- words / meanings / example_sentences は共有データ
 -- FastAPI は service role で操作するため RLS は不要

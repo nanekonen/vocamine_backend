@@ -1,5 +1,5 @@
 from __future__ import annotations
-from supabase import create_client, Client
+from supabase import Client, create_client
 from app.core.config import settings
 
 _client: Client | None = None
