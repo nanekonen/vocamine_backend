@@ -35,6 +35,16 @@ LEVEL_TIER_MAP: dict[str, int] = {
     "TOEIC 990点":    6,
 }
 
+# meanings.tier → wordbook_word_sources.source_type
+# tier 5, 6 に対応するCEFR-Jファイルは現状シードされていないため、
+# 該当時は "initial_level" にフォールバックする。
+CEFR_TIER_SOURCE_TYPES: dict[int, str] = {
+    1: "initial_level_a1",
+    2: "initial_level_a2",
+    3: "initial_level_b1",
+    4: "initial_level_b2",
+}
+
 PHRASE_LIST_DIR = Path(__file__).resolve().parents[2] / "phrase_list"
 ACL_FILENAME = "The_Academic_Collocation_List(Academic Collocation List).csv"
 TRAILING_POS_RE = re.compile(r"\s*\((?:adj|adv|n|v|vpp)\)\s*$", re.IGNORECASE)
@@ -413,6 +423,54 @@ async def analyze_lexical_items(text: str) -> list[dict]:
 
     return _dedupe_items(items)
 
+POS_SUPERTYPES = {
+    PartOfSpeech.article.value: {
+        PartOfSpeech.article.value,
+        PartOfSpeech.determiner.value,
+    },
+    PartOfSpeech.determiner.value: {
+        PartOfSpeech.determiner.value,
+    },
+    PartOfSpeech.pronoun.value: {
+        PartOfSpeech.pronoun.value,
+    },
+    PartOfSpeech.noun.value: {
+        PartOfSpeech.noun.value,
+    },
+    PartOfSpeech.verb.value: {
+        PartOfSpeech.verb.value,
+    },
+    PartOfSpeech.adjective.value: {
+        PartOfSpeech.adjective.value,
+    },
+    PartOfSpeech.adverb.value: {
+        PartOfSpeech.adverb.value,
+    },
+    PartOfSpeech.preposition.value: {
+        PartOfSpeech.preposition.value,
+    },
+    PartOfSpeech.conjunction.value: {
+        PartOfSpeech.conjunction.value,
+    },
+    PartOfSpeech.interjection.value: {
+        PartOfSpeech.interjection.value,
+    },
+    PartOfSpeech.abbreviation.value: {
+        PartOfSpeech.abbreviation.value,
+    },
+    PartOfSpeech.phrase.value: {
+        PartOfSpeech.phrase.value,
+    },
+    PartOfSpeech.auxiliary.value: {
+        PartOfSpeech.auxiliary.value,
+        PartOfSpeech.verb.value,
+    },
+}
+
+
+def pos_matches(material_pos: str, learned_pos: str) -> bool:
+    return learned_pos in POS_SUPERTYPES.get(material_pos, {material_pos})
+
 
 async def extract_unknown_words(text: str, user_id: str, enrich_meanings: bool = True) -> dict:
     """
@@ -438,8 +496,15 @@ async def extract_unknown_words(text: str, user_id: str, enrich_meanings: bool =
     unknown_items: list[dict] = []
 
     for item in lexical_items:
-        key = (item["text"], item["part_of_speech"])
-        is_learned = key in learned
+        word = item["text"].lower()
+        material_pos = item["part_of_speech"].lower()
+
+        is_learned = any(
+            learned_word == word
+            and pos_matches(material_pos, learned_pos)
+            for learned_word, learned_pos in learned
+        )
+
         has_meaning = False
         if enrich_meanings:
             lookup = await get_or_create_word(
@@ -510,6 +575,7 @@ async def bulk_register_cefr_words(user_id: str, level: str) -> int:
     """
     レベル設定時にCEFR-Jの単語（tier以下）をユーザーの学習済み単語帳に一括登録。
     すでに登録済みのものはスキップ（upsert）。
+    source_type は各単語の実際のCEFR tier（A1/A2/B1/B2）ごとに分ける。
     """
     tier = LEVEL_TIER_MAP.get(level, 0)
     if tier == 0:
@@ -517,31 +583,70 @@ async def bulk_register_cefr_words(user_id: str, level: str) -> int:
 
     db = get_supabase()
 
-    # 対象tierのmeaningを全取得
-    meanings = (
-        db.table("meanings")
-        .select("id")
-        .lte("tier", tier)
+    # 対象tierのmeaningを全取得（Supabaseの1000件制限対策）
+    page_size = 1000
+    offset = 0
+    all_meanings = []
+
+    while True:
+        response = (
+            db.table("meanings")
+            .select("id, tier")
+            .lte("tier", tier)
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+
+        rows = response.data or []
+
+        if not rows:
+            break
+
+        all_meanings.extend(rows)
+
+        if len(rows) < page_size:
+            break
+
+        offset += page_size
+
+    if not all_meanings:
+        return 0
+
+    meaning_tier_by_id: dict[int, Optional[int]] = {
+        m["id"]: m.get("tier")
+        for m in all_meanings
+    }
+
+    upsert_rows = [
+        {
+            "user_id": user_id,
+            "meaning_id": meaning_id,
+            "is_learned": True,
+        }
+        for meaning_id in meaning_tier_by_id.keys()
+    ]
+
+    response = (
+        db.table("wordbook_words")
+        .upsert(
+            upsert_rows,
+            on_conflict="user_id,meaning_id",
+        )
         .execute()
     )
 
-    if not meanings.data:
-        return 0
-
-    rows = [
-        {
-            "user_id": user_id,
-            "meaning_id": m["id"],
-            "is_learned": True,
-        }
-        for m in meanings.data
-    ]
-
-    response = db.table("wordbook_words").upsert(rows, on_conflict="user_id,meaning_id").execute()
     for row in response.data or []:
+        meaning_tier = meaning_tier_by_id.get(row["meaning_id"])
+
+        source_type = CEFR_TIER_SOURCE_TYPES.get(
+            meaning_tier,
+            "initial_level",
+        )
+
         record_wordbook_source(
             row["id"],
-            source_type="initial_level",
+            source_type=source_type,
             source_label=level,
         )
-    return len(rows)
+
+    return len(upsert_rows)

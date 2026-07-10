@@ -1,6 +1,5 @@
 from fastapi import APIRouter, File, UploadFile, HTTPException
 from app.services.ocr_service import (
-    extract_text_from_image,
     extract_text_from_pdf,
     extract_text_and_boxes_from_image,
     extract_pdf_word_boxes_from_text_layer,
@@ -21,7 +20,7 @@ MAX_PDF_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 
 @router.post("/image", response_model=OCRResponse)
 async def ocr_image(file: UploadFile = File(...)):
-    """Upload an image and get back the extracted text."""
+    """画像OCRの全文をそのまま返し、同じ全文に対してbox offsetを付与する。"""
     if file.content_type not in ALLOWED_IMAGE_TYPES:
         raise HTTPException(
             status_code=415,
@@ -37,13 +36,19 @@ async def ocr_image(file: UploadFile = File(...)):
     except ValueError as e:
         raise HTTPException(status_code=502, detail=str(e))
 
-    word_boxes = attach_word_box_offsets(word_boxes, text)
+    # OCRが返した日本語・英語・改行・句読点を含む全文を変更しない。
+    # box列から本文を作り直すと、box検出側が拾わなかった日本語が消えるため禁止する。
+    if text.strip() and word_boxes:
+        word_boxes = attach_word_box_offsets(word_boxes, text)
+    elif word_boxes:
+        text, word_boxes = text_and_offsets_from_word_boxes(word_boxes)
+
     return OCRResponse(text=text, word_boxes=word_boxes)
 
 
 @router.post("/pdf", response_model=PDFOCRResponse)
 async def ocr_pdf(file: UploadFile = File(...)):
-    """Upload a PDF and get back extracted text plus inert page previews."""
+    """PDF登録時に一度だけOCRし、全文と位置情報を保存用に返す。"""
     if file.content_type != "application/pdf":
         raise HTTPException(status_code=415, detail="Only PDF files are accepted here.")
 
@@ -52,6 +57,9 @@ async def ocr_pdf(file: UploadFile = File(...)):
         raise HTTPException(status_code=413, detail="File too large (max 50 MB).")
 
     page_image_bytes = render_pdf_pages_as_png_bytes(pdf_bytes)
+
+    # 本文抽出は日本語を含む全文を返す既存処理に任せる。
+    # 以後、box列から本文を再生成して上書きしない。
     try:
         text = await extract_text_from_pdf(pdf_bytes, page_images=page_image_bytes)
     except ValueError as e:
@@ -59,18 +67,25 @@ async def ocr_pdf(file: UploadFile = File(...)):
             raise HTTPException(status_code=502, detail=str(e))
         text = ""
 
-    word_boxes = extract_pdf_word_boxes_from_text_layer(pdf_bytes)
-    if not word_boxes:
+    word_boxes: list[dict] = []
+    if page_image_bytes:
         word_boxes = await extract_word_boxes_from_pdf_page_images(page_image_bytes)
-    if not text.strip():
-        text, word_boxes = text_and_offsets_from_word_boxes(word_boxes)
-    else:
+    if not word_boxes:
+        word_boxes = extract_pdf_word_boxes_from_text_layer(pdf_bytes)
+
+    if text.strip() and word_boxes:
+        # OCR本文を保持したまま、その本文上のoffsetだけをboxへ付ける。
         word_boxes = attach_word_box_offsets(word_boxes, text)
+    elif word_boxes:
+        # 本文抽出自体が空だった場合に限る最終フォールバック。
+        text, word_boxes = text_and_offsets_from_word_boxes(word_boxes)
+
     if not page_image_bytes and not text.strip():
         raise HTTPException(
             status_code=422,
             detail="PDFを読み込めませんでした。別のPDFを書き出してから再度試してください。",
         )
+
     return PDFOCRResponse(
         text=text,
         page_images=png_bytes_to_data_urls(page_image_bytes),

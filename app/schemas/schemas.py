@@ -128,6 +128,12 @@ class ExampleSentenceResponse(BaseModel):
     translated_sentence: Optional[str] = None
 
 
+# --- Word (embedded in Meaning) ---
+class WordInfo(BaseModel):
+    id: int
+    word: str
+
+
 # --- Meaning ---
 class MeaningResponse(BaseModel):
     id: int
@@ -141,6 +147,7 @@ class MeaningResponse(BaseModel):
     inflections: Optional[Any] = None
     source: DictionarySource
     tier: Optional[int] = None
+    words: Optional[WordInfo] = None
     example_sentences: list[ExampleSentenceResponse] = Field(default_factory=list)
 
 
