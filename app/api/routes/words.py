@@ -1,7 +1,7 @@
 from __future__ import annotations
-from time import perf_counter
+# from time import perf_counter  # Piper disabled
 from typing import Optional
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Response
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
 from app.db.supabase import get_supabase
 from app.schemas.schemas import (
     WordResponse, MeaningResponse,
@@ -21,7 +21,7 @@ from app.services.word_lookup_service import (
 )
 from app.services.dictionary_service import normalize_part_of_speech
 from app.services.user_identity_service import resolve_user_id
-from app.services.pronunciation_service import get_pronunciation_audio
+# from app.services.pronunciation_service import get_pronunciation_audio  # Piper disabled
 
 router = APIRouter(prefix="/words", tags=["Words"])
 
@@ -99,56 +99,16 @@ async def regenerate_missing_japanese(payload: RegenerateJapaneseRequest):
     return {"requested": len(set(payload.meaning_ids)), "updated": updated}
 
 
-@router.get("/pronunciation")
-async def pronunciation_direct(
-    word: str = Query(..., min_length=1),
-    ipa: Optional[str] = Query(default=None),
-):
-    """フロントが保持する語とIPAから直接生成し、DB待ち時間を発生させない。"""
-    started = perf_counter()
-    try:
-        audio = await get_pronunciation_audio(word, ipa)
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Piper synthesis failed: {exc}") from exc
-    done = perf_counter()
-    return Response(
-        content=audio,
-        media_type="audio/wav",
-        headers={"Server-Timing": f"audio;dur={(done - started) * 1000:.1f}"},
-    )
-
-
-@router.get("/pronunciation/{meaning_id}")
-async def pronunciation(meaning_id: int):
-    started = perf_counter()
-    meaning = (
-        get_supabase()
-        .table("meanings")
-        .select("ipa, words(word)")
-        .eq("id", meaning_id)
-        .maybe_single()
-        .execute()
-    )
-    if not meaning or not meaning.data:
-        raise HTTPException(status_code=404, detail="Meaning not found.")
-    row = meaning.data
-    db_done = perf_counter()
-    word = (row.get("words") or {}).get("word") or ""
-    try:
-        audio = await get_pronunciation_audio(word, row.get("ipa"))
-    except Exception as exc:
-        raise HTTPException(status_code=503, detail=f"Piper synthesis failed: {exc}") from exc
-    synthesis_done = perf_counter()
-    return Response(
-        content=audio,
-        media_type="audio/wav",
-        headers={
-            "Server-Timing": (
-                f"db;dur={(db_done - started) * 1000:.1f}, "
-                f"audio;dur={(synthesis_done - db_done) * 1000:.1f}"
-            )
-        },
-    )
+# Piper pronunciation endpoints are disabled. The web client uses the browser's
+# speech synthesis implementation instead.
+#
+# @router.get("/pronunciation")
+# async def pronunciation_direct(...):
+#     return await get_pronunciation_audio(...)
+#
+# @router.get("/pronunciation/{meaning_id}")
+# async def pronunciation(...):
+#     return await get_pronunciation_audio(...)
 
 
 @router.get("/distractors", response_model=list[MeaningResponse])

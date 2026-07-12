@@ -4,12 +4,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.api.routes import auth, materials, ocr, words, users, wordbooks
-from app.services.pronunciation_service import initialize_pronunciation_model
+# Piper is disabled for deployments that do not bundle a local voice model.
+# from app.services.pronunciation_service import initialize_pronunciation_model
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    await initialize_pronunciation_model()
+    # await initialize_pronunciation_model()  # Piper disabled
     yield
 
 app = FastAPI(
