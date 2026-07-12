@@ -13,8 +13,9 @@ import subprocess
 import tempfile
 import httpx
 from PIL import Image
-from google.cloud import vision
-from google.oauth2 import service_account
+# Google Cloud Vision is disabled.
+# from google.cloud import vision
+# from google.oauth2 import service_account
 from app.core.config import settings
 
 WORD_RE = re.compile(r"[A-Za-z]+(?:['’-][A-Za-z]+)*")
@@ -23,36 +24,14 @@ AZURE_FREE_MAX_BYTES = 4 * 1024 * 1024
 AZURE_FREE_MAX_PAGES = 2
 
 
-def _get_vision_client() -> vision.ImageAnnotatorClient:
-    if settings.google_application_credentials:
-        credentials_path = Path(settings.google_application_credentials)
-        if not credentials_path.exists():
-            raise ValueError(
-                f"Google credentials file not found: {settings.google_application_credentials}"
-            )
-        credentials = service_account.Credentials.from_service_account_file(
-            str(credentials_path)
-        )
-        return vision.ImageAnnotatorClient(credentials=credentials)
-    # Falls back to Application Default Credentials (ADC)
-    return vision.ImageAnnotatorClient()
+# def _get_vision_client() -> vision.ImageAnnotatorClient:
+#     credentials = service_account.Credentials.from_service_account_file(...)
+#     return vision.ImageAnnotatorClient(credentials=credentials)
 
 
 async def extract_text_from_image(image_bytes: bytes) -> str:
-    """Send image bytes to Google Cloud Vision and return detected text."""
-    client = _get_vision_client()
-    image = vision.Image(content=image_bytes)
-    response = client.text_detection(image=image)
-
-    if response.error.message:
-        raise ValueError(f"Vision API error: {response.error.message}")
-
-    texts = response.text_annotations
-    if not texts:
-        return ""
-
-    # First annotation contains the full detected text
-    return texts[0].description.strip()
+    """Extract image text locally with Tesseract."""
+    return text_from_word_boxes(_tesseract_boxes_from_image(image_bytes))
 
 
 def _word_boxes_from_document_response(response, page_index: int = 0) -> list[dict]:
@@ -88,15 +67,16 @@ def _word_boxes_from_document_response(response, page_index: int = 0) -> list[di
 
 
 async def extract_text_and_boxes_from_image(image_bytes: bytes) -> tuple[str, list[dict]]:
-    client = _get_vision_client()
-    image = vision.Image(content=image_bytes)
-    response = client.document_text_detection(image=image)
+    """Run image OCR through Azure, then local Tesseract."""
+    try:
+        text, boxes = await extract_text_and_boxes_with_azure([image_bytes])
+        if text.strip() or boxes:
+            return text, boxes
+    except Exception as exc:
+        print(f"[ocr] Azure image OCR failed; using Tesseract: {exc!r}")
 
-    if response.error.message:
-        raise ValueError(f"Vision API error: {response.error.message}")
-
-    text = response.full_text_annotation.text.strip()
-    return text, _word_boxes_from_document_response(response)
+    boxes = _tesseract_boxes_from_image(image_bytes)
+    return text_and_offsets_from_word_boxes(boxes)
 
 
 async def extract_text_from_pdf(
@@ -115,27 +95,6 @@ async def extract_text_from_pdf(
     images = page_images if page_images is not None else render_pdf_pages_as_png_bytes(pdf_bytes)
     if not images:
         return ""
-
-    try:
-        client = _get_vision_client()
-    except Exception:
-        return text_from_word_boxes(_tesseract_boxes_from_page_images(images))
-    page_texts: list[str] = []
-    for image_bytes in images:
-        try:
-            image = vision.Image(content=image_bytes)
-            response = client.document_text_detection(image=image)
-        except Exception:
-            continue
-        if response.error.message:
-            continue
-        page_text = response.full_text_annotation.text.strip()
-        if page_text:
-            page_texts.append(page_text)
-
-    text = "\n\n".join(page_texts).strip()
-    if text:
-        return text
 
     return text_from_word_boxes(_tesseract_boxes_from_page_images(images))
 
@@ -348,6 +307,11 @@ def attach_word_box_offsets(word_boxes: list[dict], text: str) -> list[dict]:
 
 
 def _png_dimensions(image_bytes: bytes) -> tuple[int, int]:
+    try:
+        with Image.open(BytesIO(image_bytes)) as image:
+            return (max(1, int(image.width)), max(1, int(image.height)))
+    except Exception:
+        pass
     if image_bytes[:8] != b"\x89PNG\r\n\x1a\n":
         return (1, 1)
     try:
@@ -530,58 +494,15 @@ def _sorted_rendered_page_paths(tmp_path: Path) -> list[Path]:
 
 
 async def extract_word_boxes_from_pdf_page_images(page_images: list[bytes]) -> list[dict]:
-    boxes: list[dict] = []
-    try:
-        client = _get_vision_client()
-    except Exception:
-        return _tesseract_boxes_from_page_images(page_images)
-    for index, image_bytes in enumerate(page_images):
-        try:
-            image = vision.Image(content=image_bytes)
-            response = client.document_text_detection(image=image)
-        except Exception:
-            continue
-        if response.error.message:
-            continue
-        boxes.extend(_word_boxes_from_document_response(response, page_index=index))
-    if boxes:
-        return boxes
     return _tesseract_boxes_from_page_images(page_images)
 
 
 async def extract_text_and_boxes_from_pdf_page_images(
     page_images: list[bytes],
 ) -> tuple[str, list[dict]]:
-    """OCR each rendered page once and return its full multilingual text and boxes."""
-    try:
-        client = _get_vision_client()
-    except Exception:
-        boxes = _tesseract_boxes_from_page_images(page_images)
-        return text_and_offsets_from_word_boxes(boxes)
-
-    page_texts: list[str] = []
-    boxes: list[dict] = []
-    for index, image_bytes in enumerate(page_images):
-        try:
-            image = vision.Image(content=image_bytes)
-            response = client.document_text_detection(image=image)
-        except Exception:
-            continue
-        if response.error.message:
-            continue
-        page_text = response.full_text_annotation.text.strip()
-        if page_text:
-            page_texts.append(page_text)
-        boxes.extend(_word_boxes_from_document_response(response, page_index=index))
-
-    text = "\n\n".join(page_texts).strip()
-    if text:
-        return text, attach_word_box_offsets(boxes, text)
-    if boxes:
-        return text_and_offsets_from_word_boxes(boxes)
-
-    fallback_boxes = _tesseract_boxes_from_page_images(page_images)
-    return text_and_offsets_from_word_boxes(fallback_boxes)
+    """OCR rendered PDF pages locally with Tesseract."""
+    boxes = _tesseract_boxes_from_page_images(page_images)
+    return text_and_offsets_from_word_boxes(boxes)
 
 
 def _page_images_to_azure_batches(page_images: list[bytes]) -> list[tuple[int, bytes]]:

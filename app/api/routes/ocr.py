@@ -21,7 +21,7 @@ MAX_PDF_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
 
 @router.post("/image", response_model=OCRResponse)
 async def ocr_image(file: UploadFile = File(...)):
-    """画像OCRの全文をそのまま返し、同じ全文に対してbox offsetを付与する。"""
+    """Azure、Tesseractの順で画像をOCRする。"""
     if file.content_type not in ALLOWED_IMAGE_TYPES:
         raise HTTPException(
             status_code=415,

@@ -6,7 +6,7 @@ from typing import List
 class Settings(BaseSettings):
     supabase_url: str
     supabase_service_role_key: str
-    google_application_credentials: str = ""
+    # google_application_credentials: str = ""  # Google Vision disabled
     azure_document_intelligence_endpoint: str = ""
     azure_document_intelligence_key: str = ""
     gemini_api_key: str = ""
