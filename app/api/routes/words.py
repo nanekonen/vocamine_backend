@@ -1,11 +1,12 @@
 from __future__ import annotations
 from typing import Optional
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Response
 from app.db.supabase import get_supabase
 from app.schemas.schemas import (
-    WordResponse,
+    WordResponse, MeaningResponse,
     WordbookWordCreate, WordbookWordUpdate, WordbookWordResponse,
     ExtractWordsRequest, ExtractWordsResponse,
+    StoredMeaningsRequest,
     BatchWordsRequest, BatchWordsResponse, BatchWordResult,
 )
 from app.services.word_service import enrich_lexical_items, extract_unknown_words
@@ -17,8 +18,31 @@ from app.services.word_lookup_service import (
 )
 from app.services.dictionary_service import normalize_part_of_speech
 from app.services.user_identity_service import resolve_user_id
+from app.services.pronunciation_service import get_pronunciation_audio
 
 router = APIRouter(prefix="/words", tags=["Words"])
+
+
+def add_entries_to_independent_wordbook(
+    user_id: str,
+    wordbook_id: Optional[str],
+    wordbook_word_ids: list[int],
+) -> None:
+    if not wordbook_id or not wordbook_word_ids:
+        return
+    db = get_supabase()
+    owned = db.table("wordbooks").select("id").eq("id", wordbook_id).eq(
+        "user_id", user_id
+    ).maybe_single().execute().data
+    if not owned:
+        raise HTTPException(status_code=404, detail="Wordbook not found.")
+    db.table("wordbook_memberships").upsert(
+        [
+            {"wordbook_id": wordbook_id, "wordbook_word_id": entry_id}
+            for entry_id in wordbook_word_ids
+        ],
+        on_conflict="wordbook_id,wordbook_word_id",
+    ).execute()
 
 
 # ── Word 登録 ─────────────────────────────────────────────────────────────────
@@ -54,6 +78,69 @@ async def lookup_word(
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"Word lookup failed: {e}") from e
     return result
+
+
+@router.post("/stored-meanings", response_model=list[WordResponse])
+async def get_stored_meanings(payload: StoredMeaningsRequest):
+    """教材画面向けに、DB保存済みの意味だけを一括取得する。外部辞書は呼ばない。"""
+    words = sorted({
+        item.text.strip().lower().replace("’", "'")
+        for item in payload.items
+        if item.text.strip()
+    })
+    if not words:
+        return []
+    response = (
+        get_supabase()
+        .table("words")
+        .select("*, meanings(*, example_sentences(*))")
+        .in_("word", words)
+        .execute()
+    )
+    return response.data or []
+
+
+@router.get("/pronunciation/{meaning_id}")
+async def pronunciation(meaning_id: int):
+    meaning = (
+        get_supabase()
+        .table("meanings")
+        .select("ipa, words(word)")
+        .eq("id", meaning_id)
+        .maybe_single()
+        .execute()
+    )
+    if not meaning or not meaning.data:
+        raise HTTPException(status_code=404, detail="Meaning not found.")
+    row = meaning.data
+    word = (row.get("words") or {}).get("word") or ""
+    try:
+        audio = await get_pronunciation_audio(word, row.get("ipa"))
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Piper synthesis failed: {exc}") from exc
+    return Response(content=audio, media_type="audio/wav")
+
+
+@router.get("/distractors", response_model=list[MeaningResponse])
+async def get_distractors(
+    part_of_speech: str = Query(...),
+    exclude_meaning_ids: str = Query(default=""),
+    limit: int = Query(default=20, ge=1, le=100),
+):
+    """4択用に、DB保存済みの同品詞の意味を返す。外部検索・生成は行わない。"""
+    excluded = {
+        int(value) for value in exclude_meaning_ids.split(",")
+        if value.strip().isdigit()
+    }
+    query = (
+        get_supabase()
+        .table("meanings")
+        .select("*, words(*), example_sentences(*)")
+        .eq("part_of_speech", part_of_speech)
+    )
+    if excluded:
+        query = query.not_.in_("id", sorted(excluded))
+    return query.limit(limit).execute().data or []
 
 
 @router.get("/{word_id}", response_model=WordResponse)
@@ -127,7 +214,9 @@ async def add_words_batch(payload: BatchWordsRequest):
             source_material_id=payload.source_material_id,
             source_folder_id=payload.source_folder_id,
             source_label=payload.source_label,
+            is_learned=payload.is_learned,
         )
+        add_entries_to_independent_wordbook(user_id, payload.wordbook_id, added_ids)
         registered_count += 1
         results.append(BatchWordResult(
             word=word,
@@ -153,17 +242,22 @@ async def get_wordbook(
     source_type: Optional[str] = Query(default=None),
     source_material_id: Optional[str] = Query(default=None),
     source_folder_id: Optional[str] = Query(default=None),
+    wordbook_id: Optional[str] = Query(default=None),
 ):
     """ユーザーの単語帳を取得（is_learnedでフィルタ可能）"""
     user_id = resolve_user_id(user_id)
     db = get_supabase()
     def build_query(include_sources: bool):
         select = "*, meanings(*, words(*), example_sentences(*))"
+        if wordbook_id:
+            select += ", wordbook_memberships!inner(wordbook_id)"
         if include_sources:
             select += ", wordbook_word_sources(*)"
         query = db.table("wordbook_words").select(select).eq("user_id", user_id)
         if is_learned is not None:
             query = query.eq("is_learned", is_learned)
+        if wordbook_id:
+            query = query.eq("wordbook_memberships.wordbook_id", wordbook_id)
         return query.order("created_at", desc=True)
 
     include_sources = True
@@ -224,6 +318,9 @@ async def add_to_wordbook(user_id: str, payload: WordbookWordCreate):
                 source_folder_id=payload.source_folder_id,
                 source_label=payload.source_label,
             )
+            add_entries_to_independent_wordbook(
+                user_id, payload.wordbook_id, [existing.data[0]["id"]]
+            )
             return updated.data[0] if updated.data else existing.data[0]
         response = db.table("wordbook_words").insert({
             "user_id": user_id,
@@ -236,6 +333,9 @@ async def add_to_wordbook(user_id: str, payload: WordbookWordCreate):
             source_material_id=payload.source_material_id,
             source_folder_id=payload.source_folder_id,
             source_label=payload.source_label,
+        )
+        add_entries_to_independent_wordbook(
+            user_id, payload.wordbook_id, [response.data[0]["id"]]
         )
         return response.data[0]
     except HTTPException:

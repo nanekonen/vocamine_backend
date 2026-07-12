@@ -15,13 +15,13 @@ from reportlab.pdfgen import canvas
 
 from app.db.supabase import get_supabase
 from app.schemas.schemas import (
-    MaterialCreate,
-    MaterialFolderCreate,
+    MaterialCreate, MaterialUpdate, MaterialPagesAppend,
+    MaterialFolderCreate, MaterialFolderUpdate,
     MaterialFolderResponse,
     MaterialLibraryResponse,
     MaterialResponse,
 )
-from app.services.object_storage_service import get_bytes, put_bytes
+from app.services.object_storage_service import delete_keys, get_bytes, put_bytes
 from app.services.ocr_service import (
     attach_word_box_offsets,
     render_pdf_pages_as_png_bytes,
@@ -47,7 +47,7 @@ def _data_url_from_png_base64(value: str) -> str:
     return f"data:image/png;base64,{payload}"
 
 
-TEXT_LAYER_VERSION = 2
+TEXT_LAYER_VERSION = 3
 
 READABLE_PDF_FONT = "HeiseiMin-W3"
 try:
@@ -258,6 +258,67 @@ async def create_folder(payload: MaterialFolderCreate):
     return response.data[0]
 
 
+@router.patch("/folders/{folder_id}", response_model=MaterialFolderResponse)
+async def update_folder(folder_id: str, payload: MaterialFolderUpdate):
+    user_id = resolve_user_id(payload.user_id)
+    db = get_supabase()
+    folder = db.table("material_folders").select("*").eq("id", folder_id).eq(
+        "user_id", user_id
+    ).maybe_single().execute().data
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found.")
+    updates = {}
+    if payload.name is not None:
+        name = payload.name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="フォルダ名を入力してください。")
+        updates["name"] = name
+    if payload.update_parent:
+        if payload.parent_id == folder_id:
+            raise HTTPException(status_code=400, detail="同じフォルダには移動できません。")
+        if payload.parent_id:
+            parent = db.table("material_folders").select("id, parent_id").eq(
+                "id", payload.parent_id
+            ).eq("user_id", user_id).maybe_single().execute().data
+            if not parent:
+                raise HTTPException(status_code=404, detail="Folder not found.")
+            current = parent
+            while current:
+                if current["id"] == folder_id:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="移動先に子フォルダは指定できません。",
+                    )
+                parent_id = current.get("parent_id")
+                if not parent_id:
+                    break
+                current = db.table("material_folders").select("id, parent_id").eq(
+                    "id", parent_id
+                ).maybe_single().execute().data
+        updates["parent_id"] = payload.parent_id
+    if updates:
+        folder = db.table("material_folders").update(updates).eq(
+            "id", folder_id
+        ).eq("user_id", user_id).execute().data[0]
+    return folder
+
+
+@router.delete("/folders/{folder_id}", status_code=204)
+async def delete_folder(folder_id: str, user_id: str = Query(...)):
+    user_id = resolve_user_id(user_id)
+    db = get_supabase()
+    folder = db.table("material_folders").select("id").eq("id", folder_id).eq(
+        "user_id", user_id
+    ).maybe_single().execute().data
+    if not folder:
+        raise HTTPException(status_code=404, detail="Folder not found.")
+    # 教材はFKの ON DELETE SET NULL により教材トップへ戻る。
+    # 子フォルダはスキーマ定義どおりカスケード削除される。
+    db.table("material_folders").delete().eq("id", folder_id).eq(
+        "user_id", user_id
+    ).execute()
+
+
 @router.post("", response_model=MaterialResponse, status_code=201)
 async def create_material(payload: MaterialCreate):
     user_id = resolve_user_id(payload.user_id)
@@ -362,6 +423,117 @@ async def create_material(payload: MaterialCreate):
     return row
 
 
+@router.patch("/{material_id}", response_model=MaterialResponse)
+async def update_material(material_id: str, payload: MaterialUpdate):
+    user_id = resolve_user_id(payload.user_id)
+    db = get_supabase()
+    current = (
+        db.table("materials").select("*").eq("id", material_id)
+        .eq("user_id", user_id).maybe_single().execute().data
+    )
+    if not current:
+        raise HTTPException(status_code=404, detail="Material not found.")
+
+    updates = {}
+    if payload.title is not None:
+        title = payload.title.strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="教材名を入力してください。")
+        duplicate = (
+            db.table("materials").select("id").eq("user_id", user_id)
+            .ilike("title", title).neq("id", material_id).limit(1).execute().data
+            or []
+        )
+        if duplicate:
+            raise HTTPException(status_code=409, detail="同じ名前の教材は登録できません。")
+        updates["title"] = title
+        # 削除後も表示される出典名を、現在の教材名と揃える。
+        try:
+            db.table("wordbook_word_sources").update({"label": title}).eq(
+                "material_id", material_id
+            ).execute()
+        except Exception:
+            pass
+    if payload.update_folder:
+        if payload.folder_id:
+            folder = (
+                db.table("material_folders").select("id").eq("id", payload.folder_id)
+                .eq("user_id", user_id).maybe_single().execute().data
+            )
+            if not folder:
+                raise HTTPException(status_code=404, detail="Folder not found.")
+        updates["folder_id"] = payload.folder_id
+        try:
+            db.table("wordbook_word_sources").update(
+                {"folder_id": payload.folder_id}
+            ).eq("material_id", material_id).execute()
+        except Exception:
+            pass
+    if updates:
+        current = db.table("materials").update(updates).eq(
+            "id", material_id
+        ).eq("user_id", user_id).execute().data[0]
+    return _load_material_assets(dict(current))
+
+
+@router.post("/{material_id}/pages", response_model=MaterialResponse)
+async def append_material_pages(material_id: str, payload: MaterialPagesAppend):
+    user_id = resolve_user_id(payload.user_id)
+    db = get_supabase()
+    row = (
+        db.table("materials").select("*").eq("id", material_id)
+        .eq("user_id", user_id).maybe_single().execute().data
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail="Material not found.")
+    loaded = _load_material_assets(dict(row))
+    old_text = str(loaded.get("extracted_text") or "")
+    new_text = payload.extracted_text.strip()
+    if not new_text:
+        raise HTTPException(status_code=400, detail="追加ページから文字を取得できませんでした。")
+
+    existing_images = []
+    try:
+        existing_images = json.loads(
+            get_bytes(_json_key(user_id, material_id, "page_images")).decode("utf-8")
+        )
+    except Exception:
+        source_key = row.get("source_object_storage_key")
+        if source_key and row.get("source_mime_type", "").startswith("image/"):
+            existing_images = [base64.b64encode(get_bytes(source_key)).decode("ascii")]
+    incoming_images = [
+        value.split(",", 1)[1] if "," in value[:64] else value
+        for value in payload.page_images_base64
+    ]
+    page_offset = max(
+        len(existing_images),
+        max((int(box.get("page_index") or 0) + 1 for box in loaded["word_boxes"]), default=0),
+    )
+    separator = "\n\n" if old_text else ""
+    text_offset = len(old_text + separator)
+    new_boxes = []
+    for box_model in payload.word_boxes:
+        box = box_model.model_dump()
+        box["page_index"] = int(box.get("page_index") or 0) + page_offset
+        if box.get("start") is not None:
+            box["start"] += text_offset
+        if box.get("end") is not None:
+            box["end"] += text_offset
+        new_boxes.append(box)
+    combined_text = old_text + separator + new_text
+    combined_boxes = list(loaded["word_boxes"]) + new_boxes
+    put_bytes(
+        _json_key(user_id, material_id, "page_images"),
+        json.dumps(existing_images + incoming_images).encode("utf-8"),
+        "application/json",
+    )
+    _save_text_layer(user_id, material_id, combined_text, combined_boxes, "pages_appended")
+    updated = db.table("materials").update({"extracted_text": combined_text}).eq(
+        "id", material_id
+    ).eq("user_id", user_id).execute().data[0]
+    return _load_material_assets(dict(updated))
+
+
 @router.get("/{material_id}/source")
 async def get_material_source(material_id: str, user_id: str = Query(...)):
     user_id = resolve_user_id(user_id)
@@ -381,6 +553,90 @@ async def get_material_source(material_id: str, user_id: str = Query(...)):
         "mime_type": response.data.get("source_mime_type"),
         "base64": base64.b64encode(data).decode("ascii"),
     }
+
+
+@router.delete("/{material_id}", status_code=204)
+async def delete_material(material_id: str, user_id: str = Query(...)):
+    """教材を削除し、教材由来の単語は「削除した教材」出典として残す。"""
+    user_id = resolve_user_id(user_id)
+    db = get_supabase()
+    material = (
+        db.table("materials")
+        .select(
+            "id, title, source_object_storage_key, "
+            "readable_pdf_object_storage_key"
+        )
+        .eq("id", material_id)
+        .eq("user_id", user_id)
+        .maybe_single()
+        .execute()
+        .data
+    )
+    if not material:
+        raise HTTPException(status_code=404, detail="Material not found.")
+
+    # material_id はFKの ON DELETE SET NULL でも消えるが、先に出典種別と
+    # 教材名を退避することで、削除後も単語帳から由来を確認できるようにする。
+    try:
+        sources = (
+            db.table("wordbook_word_sources")
+            .select("id, wordbook_word_id")
+            .eq("material_id", material_id)
+            .execute()
+            .data
+            or []
+        )
+        for source in sources:
+            existing_response = (
+                db.table("wordbook_word_sources")
+                .select("id")
+                .eq("wordbook_word_id", source["wordbook_word_id"])
+                .eq("source_type", "deleted_material")
+                .eq("label", material["title"])
+                .maybe_single()
+                .execute()
+            )
+            # supabase-py のバージョンによっては、maybe_single() が0件の
+            # とき APIResponse(data=None) ではなく None 自体を返す。
+            existing = getattr(existing_response, "data", None)
+            if existing:
+                db.table("wordbook_word_sources").delete().eq(
+                    "id", source["id"]
+                ).execute()
+            else:
+                (
+                    db.table("wordbook_word_sources")
+                    .update({
+                        "source_type": "deleted_material",
+                        "material_id": None,
+                        "folder_id": None,
+                        "label": material["title"],
+                    })
+                    .eq("id", source["id"])
+                    .execute()
+                )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to preserve material word sources: {exc}",
+        ) from exc
+
+    db.table("materials").delete().eq("id", material_id).eq(
+        "user_id", user_id
+    ).execute()
+
+    keys = [
+        material.get("source_object_storage_key"),
+        material.get("readable_pdf_object_storage_key"),
+        _json_key(user_id, material_id, "page_images"),
+        _json_key(user_id, material_id, "word_boxes"),
+        _json_key(user_id, material_id, "text_layer"),
+    ]
+    try:
+        delete_keys([key for key in keys if key])
+    except Exception:
+        # DB上の削除を優先する。ストレージ上の孤立ファイルは再試行可能。
+        pass
 
 
 @router.get("/{material_id}/readable-pdf")

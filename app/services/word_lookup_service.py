@@ -555,6 +555,7 @@ async def add_meanings_to_wordbook(
     source_material_id: Optional[str] = None,
     source_folder_id: Optional[str] = None,
     source_label: Optional[str] = None,
+    is_learned: bool = False,
 ) -> list[int]:
     """
     指定した word_id の全 meaning を、ユーザーの単語帳に「未学習」として追加する。
@@ -587,13 +588,13 @@ async def add_meanings_to_wordbook(
     if existing_by_meaning_id:
         (
             db.table("wordbook_words")
-            .update({"is_learned": False})
+            .update({"is_learned": is_learned})
             .in_("id", list(existing_by_meaning_id.values()))
             .execute()
         )
 
     rows_to_insert = [
-        {"user_id": user_id, "meaning_id": mid, "is_learned": False}
+        {"user_id": user_id, "meaning_id": mid, "is_learned": is_learned}
         for mid in meaning_ids
         if mid not in existing_by_meaning_id
     ]
@@ -613,4 +614,5 @@ async def add_meanings_to_wordbook(
             source_folder_id=source_folder_id,
             source_label=source_label,
         )
-    return inserted_ids
+    # 呼び出し側が独立単語帳への所属を作れるよう、既存分も含む全IDを返す。
+    return list(existing_by_meaning_id.values())

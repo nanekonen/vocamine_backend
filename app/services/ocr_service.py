@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import csv
 from io import BytesIO
 from pathlib import Path
@@ -10,11 +11,16 @@ import shutil
 import struct
 import subprocess
 import tempfile
+import httpx
+from PIL import Image
 from google.cloud import vision
 from google.oauth2 import service_account
 from app.core.config import settings
 
 WORD_RE = re.compile(r"[A-Za-z]+(?:['’-][A-Za-z]+)*")
+AZURE_API_VERSION = "2024-11-30"
+AZURE_FREE_MAX_BYTES = 4 * 1024 * 1024
+AZURE_FREE_MAX_PAGES = 2
 
 
 def _get_vision_client() -> vision.ImageAnnotatorClient:
@@ -258,14 +264,10 @@ def text_from_word_boxes(word_boxes: list[dict]) -> str:
 
 
 def text_and_offsets_from_word_boxes(word_boxes: list[dict]) -> tuple[str, list[dict]]:
-    ordered = sorted(
-        word_boxes,
-        key=lambda box: (
-            int(box.get("page_index") or 0),
-            round(float(box.get("top") or 0) * 100),
-            float(box.get("left") or 0),
-        ),
-    )
+    # Vision/Tesseract already return boxes in document reading order. Sorting
+    # every box globally by top/left breaks multi-column documents and can move
+    # a heading from the beginning to the end of the extracted text.
+    ordered = word_boxes
     text_parts: list[str] = []
     boxes_with_offsets: list[dict] = []
     cursor = 0
@@ -289,30 +291,57 @@ def text_and_offsets_from_word_boxes(word_boxes: list[dict]) -> tuple[str, list[
 def attach_word_box_offsets(word_boxes: list[dict], text: str) -> list[dict]:
     if not word_boxes or not text:
         return word_boxes
-    if all(box.get("start") is not None and box.get("end") is not None for box in word_boxes):
-        return word_boxes
 
     with_offsets: list[dict] = []
     cursor = 0
-    for box in sorted(
-        word_boxes,
-        key=lambda item: (
-            int(item.get("page_index") or 0),
-            round(float(item.get("top") or 0) * 100),
-            float(item.get("left") or 0),
-        ),
-    ):
+    used_ranges: set[tuple[int, int]] = set()
+    # Keep the OCR provider's reading order. The text returned by the same OCR
+    # pass follows this order, so cursor-based matching remains aligned.
+    for box in word_boxes:
         raw = str(box.get("text") or "").strip()
         if not raw:
             continue
-        start = text.find(raw, cursor)
-        if start < 0:
-            match = re.search(r"[A-Za-z]+(?:['’-][A-Za-z]+)*", raw)
-            start = text.find(match.group(0), cursor) if match else -1
         copied = dict(box)
+        copied.pop("start", None)
+        copied.pop("end", None)
+
+        candidates: list[tuple[int, int]] = []
+        search_from = 0
+        while True:
+            found = text.find(raw, search_from)
+            if found < 0:
+                break
+            candidates.append((found, found + len(raw)))
+            search_from = found + max(1, len(raw))
+
+        # Prefer the OCR reading-order continuation, but if embedded PDF text
+        # has moved a heading/column, use the first still-unassigned occurrence
+        # instead of dropping every subsequent box.
+        unused = [item for item in candidates if item not in used_ranges]
+        after_cursor = [item for item in unused if item[0] >= cursor]
+        chosen = after_cursor[0] if after_cursor else (unused[0] if unused else None)
+
+        if chosen is None:
+            match = re.search(r"[A-Za-z]+(?:['’-][A-Za-z]+)*", raw)
+            token = match.group(0) if match else None
+            if token:
+                token_candidates = [
+                    (item.start(), item.end())
+                    for item in re.finditer(re.escape(token), text)
+                    if (item.start(), item.end()) not in used_ranges
+                ]
+                token_after_cursor = [item for item in token_candidates if item[0] >= cursor]
+                chosen = (
+                    token_after_cursor[0]
+                    if token_after_cursor
+                    else (token_candidates[0] if token_candidates else None)
+                )
+
+        start = chosen[0] if chosen else -1
         if start >= 0:
             copied["start"] = start
-            copied["end"] = start + len(raw)
+            copied["end"] = chosen[1]
+            used_ranges.add(chosen)
             cursor = copied["end"]
         with_offsets.append(copied)
     return with_offsets
@@ -334,6 +363,8 @@ def _tesseract_boxes_from_image(image_bytes: bytes, page_index: int = 0) -> list
         return []
 
     image_width, image_height = _png_dimensions(image_bytes)
+    tessdata_dir = Path(tesseract).resolve().parent.parent / "share" / "tessdata"
+    language = "jpn+eng" if (tessdata_dir / "jpn.traineddata").exists() else "eng"
     with tempfile.TemporaryDirectory() as tmpdir:
         image_path = Path(tmpdir) / "page.png"
         image_path.write_bytes(image_bytes)
@@ -344,9 +375,9 @@ def _tesseract_boxes_from_image(image_bytes: bytes, page_index: int = 0) -> list
                     str(image_path),
                     "stdout",
                     "-l",
-                    "eng",
+                    language,
                     "--psm",
-                    "6",
+                    "3",
                     "tsv",
                 ],
                 check=True,
@@ -516,3 +547,150 @@ async def extract_word_boxes_from_pdf_page_images(page_images: list[bytes]) -> l
     if boxes:
         return boxes
     return _tesseract_boxes_from_page_images(page_images)
+
+
+async def extract_text_and_boxes_from_pdf_page_images(
+    page_images: list[bytes],
+) -> tuple[str, list[dict]]:
+    """OCR each rendered page once and return its full multilingual text and boxes."""
+    try:
+        client = _get_vision_client()
+    except Exception:
+        boxes = _tesseract_boxes_from_page_images(page_images)
+        return text_and_offsets_from_word_boxes(boxes)
+
+    page_texts: list[str] = []
+    boxes: list[dict] = []
+    for index, image_bytes in enumerate(page_images):
+        try:
+            image = vision.Image(content=image_bytes)
+            response = client.document_text_detection(image=image)
+        except Exception:
+            continue
+        if response.error.message:
+            continue
+        page_text = response.full_text_annotation.text.strip()
+        if page_text:
+            page_texts.append(page_text)
+        boxes.extend(_word_boxes_from_document_response(response, page_index=index))
+
+    text = "\n\n".join(page_texts).strip()
+    if text:
+        return text, attach_word_box_offsets(boxes, text)
+    if boxes:
+        return text_and_offsets_from_word_boxes(boxes)
+
+    fallback_boxes = _tesseract_boxes_from_page_images(page_images)
+    return text_and_offsets_from_word_boxes(fallback_boxes)
+
+
+def _page_images_to_azure_batches(page_images: list[bytes]) -> list[tuple[int, bytes]]:
+    """Build PDFs within Azure F0's two-page and four-MB limits."""
+    batches: list[tuple[int, bytes]] = []
+    for start in range(0, len(page_images), AZURE_FREE_MAX_PAGES):
+        sources = page_images[start:start + AZURE_FREE_MAX_PAGES]
+        scale, quality = 1.0, 88
+        while True:
+            converted: list[Image.Image] = []
+            try:
+                for raw in sources:
+                    image = Image.open(BytesIO(raw)).convert("RGB")
+                    if scale < 1.0:
+                        image = image.resize(
+                            (max(50, int(image.width * scale)), max(50, int(image.height * scale))),
+                            Image.Resampling.LANCZOS,
+                        )
+                    converted.append(image)
+                output = BytesIO()
+                converted[0].save(
+                    output,
+                    format="PDF",
+                    save_all=True,
+                    append_images=converted[1:],
+                    resolution=150,
+                    quality=quality,
+                )
+                payload = output.getvalue()
+            finally:
+                for image in converted:
+                    image.close()
+            if len(payload) < AZURE_FREE_MAX_BYTES:
+                batches.append((start, payload))
+                break
+            if quality > 55:
+                quality -= 12
+            elif scale > 0.55:
+                scale *= 0.8
+            else:
+                raise ValueError("A page could not be reduced below Azure F0's 4 MB limit.")
+    return batches
+
+
+def _azure_word_box(word: dict, page: dict, page_index: int) -> dict | None:
+    polygon = word.get("polygon") or []
+    if len(polygon) < 8:
+        return None
+    xs = [float(polygon[index]) for index in range(0, len(polygon), 2)]
+    ys = [float(polygon[index]) for index in range(1, len(polygon), 2)]
+    page_width = float(page.get("width") or 1)
+    page_height = float(page.get("height") or 1)
+    return {
+        "text": str(word.get("content") or "").strip(),
+        "page_index": page_index,
+        "left": max(0.0, min(xs) / page_width),
+        "top": max(0.0, min(ys) / page_height),
+        "width": max(0.0, (max(xs) - min(xs)) / page_width),
+        "height": max(0.0, (max(ys) - min(ys)) / page_height),
+    }
+
+
+async def _analyze_azure_pdf(payload: bytes) -> dict:
+    endpoint = settings.azure_document_intelligence_endpoint.rstrip("/")
+    key = settings.azure_document_intelligence_key
+    if not endpoint or not key:
+        raise ValueError("Azure Document Intelligence is not configured.")
+    url = f"{endpoint}/documentintelligence/documentModels/prebuilt-read:analyze"
+    auth = {"Ocp-Apim-Subscription-Key": key}
+    async with httpx.AsyncClient(timeout=60) as client:
+        response = await client.post(
+            url,
+            params={"api-version": AZURE_API_VERSION},
+            headers={**auth, "Content-Type": "application/pdf"},
+            content=payload,
+        )
+        response.raise_for_status()
+        operation_url = response.headers.get("operation-location")
+        if not operation_url:
+            raise ValueError("Azure did not return operation-location.")
+        for _ in range(120):
+            await asyncio.sleep(1.0)  # F0: one GET operation per second.
+            result_response = await client.get(operation_url, headers=auth)
+            result_response.raise_for_status()
+            result = result_response.json()
+            if result.get("status") == "succeeded":
+                return result.get("analyzeResult") or {}
+            if result.get("status") in {"failed", "canceled"}:
+                raise ValueError(f"Azure analysis failed: {result.get('error')}")
+    raise TimeoutError("Azure Document Intelligence analysis timed out.")
+
+
+async def extract_text_and_boxes_with_azure(
+    page_images: list[bytes],
+) -> tuple[str, list[dict]]:
+    texts: list[str] = []
+    boxes: list[dict] = []
+    for batch_start, payload in _page_images_to_azure_batches(page_images):
+        result = await _analyze_azure_pdf(payload)
+        content = str(result.get("content") or "").strip()
+        if content:
+            texts.append(content)
+        for local_index, page in enumerate(result.get("pages") or []):
+            page_number = int(page.get("pageNumber") or local_index + 1)
+            page_index = batch_start + page_number - 1
+            for word in page.get("words") or []:
+                box = _azure_word_box(word, page, page_index)
+                if box and box["text"]:
+                    boxes.append(box)
+        await asyncio.sleep(1.0)  # F0: one analyze transaction per second.
+    text = "\n\n".join(texts).strip()
+    return text, attach_word_box_offsets(boxes, text)

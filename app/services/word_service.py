@@ -327,20 +327,34 @@ def _dedupe_items(items: list[dict]) -> list[dict]:
 
 async def get_learned_lexical_items(user_id: str) -> set[tuple[str, str]]:
     db = get_supabase()
-    response = (
-        db.table("wordbook_words")
-        .select("meanings(part_of_speech, words(word))")
-        .eq("user_id", user_id)
-        .eq("is_learned", True)
-        .execute()
-    )
     learned: set[tuple[str, str]] = set()
-    for row in (response.data or []):
-        meaning = row.get("meanings") or {}
-        word = (meaning.get("words") or {}).get("word")
-        pos = meaning.get("part_of_speech")
-        if word and pos:
-            learned.add((word.lower(), pos))
+    page_size = 1000
+    offset = 0
+
+    # Supabase/PostgRESTは指定しない場合、取得結果を最大1,000行に制限する。
+    # 初期レベル登録だけで1,000件を超えるため、全ページを取得しないと
+    # 後半の学習済み単語が未知語として誤判定される。
+    while True:
+        response = (
+            db.table("wordbook_words")
+            .select("meanings(part_of_speech, words(word))")
+            .eq("user_id", user_id)
+            .eq("is_learned", True)
+            .order("id")
+            .range(offset, offset + page_size - 1)
+            .execute()
+        )
+        rows = response.data or []
+        for row in rows:
+            meaning = row.get("meanings") or {}
+            word = (meaning.get("words") or {}).get("word")
+            pos = meaning.get("part_of_speech")
+            if word and pos:
+                learned.add((word.strip().lower().replace("’", "'"), pos))
+
+        if len(rows) < page_size:
+            break
+        offset += page_size
     return learned
 
 
@@ -430,9 +444,13 @@ POS_SUPERTYPES = {
     },
     PartOfSpeech.determiner.value: {
         PartOfSpeech.determiner.value,
+        PartOfSpeech.article.value,
+        PartOfSpeech.pronoun.value,
+        PartOfSpeech.adjective.value,
     },
     PartOfSpeech.pronoun.value: {
         PartOfSpeech.pronoun.value,
+        PartOfSpeech.determiner.value,
     },
     PartOfSpeech.noun.value: {
         PartOfSpeech.noun.value,
@@ -496,8 +514,8 @@ async def extract_unknown_words(text: str, user_id: str, enrich_meanings: bool =
     unknown_items: list[dict] = []
 
     for item in lexical_items:
-        word = item["text"].lower()
-        material_pos = item["part_of_speech"].lower()
+        word = item["text"].strip().lower().replace("’", "'")
+        material_pos = item["part_of_speech"].strip().lower()
 
         is_learned = any(
             learned_word == word

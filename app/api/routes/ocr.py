@@ -3,7 +3,8 @@ from app.services.ocr_service import (
     extract_text_from_pdf,
     extract_text_and_boxes_from_image,
     extract_pdf_word_boxes_from_text_layer,
-    extract_word_boxes_from_pdf_page_images,
+    extract_text_and_boxes_from_pdf_page_images,
+    extract_text_and_boxes_with_azure,
     png_bytes_to_data_urls,
     render_pdf_pages_as_png_bytes,
     attach_word_box_offsets,
@@ -58,26 +59,34 @@ async def ocr_pdf(file: UploadFile = File(...)):
 
     page_image_bytes = render_pdf_pages_as_png_bytes(pdf_bytes)
 
-    # 本文抽出は日本語を含む全文を返す既存処理に任せる。
-    # 以後、box列から本文を再生成して上書きしない。
-    try:
-        text = await extract_text_from_pdf(pdf_bytes, page_images=page_image_bytes)
-    except ValueError as e:
-        if not page_image_bytes:
-            raise HTTPException(status_code=502, detail=str(e))
-        text = ""
-
+    text = ""
     word_boxes: list[dict] = []
     if page_image_bytes:
-        word_boxes = await extract_word_boxes_from_pdf_page_images(page_image_bytes)
+        # Azure Document Intelligenceを主系とし、未設定・無料枠制限・通信障害時は
+        # 日本語対応Tesseractへフォールバックする。表示時には再OCRしない。
+        try:
+            text, word_boxes = await extract_text_and_boxes_with_azure(page_image_bytes)
+        except Exception as exc:
+            print(f"[ocr] Azure failed; using Tesseract fallback: {exc!r}")
+            text, word_boxes = await extract_text_and_boxes_from_pdf_page_images(
+                page_image_bytes
+            )
+
+    if not text.strip():
+        try:
+            text = await extract_text_from_pdf(pdf_bytes, page_images=[])
+        except ValueError as e:
+            if not page_image_bytes:
+                raise HTTPException(status_code=502, detail=str(e))
+
     if not word_boxes:
         word_boxes = extract_pdf_word_boxes_from_text_layer(pdf_bytes)
 
     if text.strip() and word_boxes:
-        # OCR本文を保持したまま、その本文上のoffsetだけをboxへ付ける。
+        # 日本語・改行・句読点を含む抽出本文は変更せず、原文上のboxだけを
+        # その本文へ対応付ける。
         word_boxes = attach_word_box_offsets(word_boxes, text)
     elif word_boxes:
-        # 本文抽出自体が空だった場合に限る最終フォールバック。
         text, word_boxes = text_and_offsets_from_word_boxes(word_boxes)
 
     if not page_image_bytes and not text.strip():

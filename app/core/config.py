@@ -7,10 +7,15 @@ class Settings(BaseSettings):
     supabase_url: str
     supabase_service_role_key: str
     google_application_credentials: str = ""
+    azure_document_intelligence_endpoint: str = ""
+    azure_document_intelligence_key: str = ""
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
     wiktionary_user_agent: str = "Vocamine/0.1 (local development; contact unset)"
     app_env: str = "development"
+    piper_http_url: str = "http://127.0.0.1:5001"
+    piper_voice: str = "en_US-lessac-medium"
+    piper_audio_cache_dir: str = ".cache/piper_audio"
     cors_origins: List[str] = ["http://localhost:3000"]
     oracle_object_storage_namespace: str = Field(
         "",

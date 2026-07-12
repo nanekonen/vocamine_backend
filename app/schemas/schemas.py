@@ -87,6 +87,13 @@ class MaterialFolderResponse(BaseModel):
     created_at: datetime
 
 
+class MaterialFolderUpdate(BaseModel):
+    user_id: str
+    name: Optional[str] = None
+    parent_id: Optional[str] = None
+    update_parent: bool = False
+
+
 class MaterialCreate(BaseModel):
     user_id: str
     title: str
@@ -100,10 +107,25 @@ class MaterialCreate(BaseModel):
     word_boxes: list[OCRWordBox] = Field(default_factory=list)
 
 
+class MaterialUpdate(BaseModel):
+    user_id: str
+    title: Optional[str] = None
+    folder_id: Optional[str] = None
+    update_folder: bool = False
+
+
+class MaterialPagesAppend(BaseModel):
+    user_id: str
+    extracted_text: str
+    page_images_base64: list[str] = Field(default_factory=list)
+    word_boxes: list[OCRWordBox] = Field(default_factory=list)
+
+
 class MaterialResponse(BaseModel):
     id: str
     user_id: str
     folder_id: Optional[str] = None
+    default_wordbook_id: Optional[str] = None
     title: str
     extracted_text: str = ""
     source_mime_type: Optional[str] = None
@@ -188,6 +210,7 @@ class WordbookWordCreate(BaseModel):
     source_material_id: Optional[str] = None
     source_folder_id: Optional[str] = None
     source_label: Optional[str] = None
+    wordbook_id: Optional[str] = None
 
 
 class WordbookWordUpdate(BaseModel):
@@ -217,6 +240,10 @@ class ExtractWordsRequest(BaseModel):
     background_enrich_meanings: bool = True
 
 
+class StoredMeaningsRequest(BaseModel):
+    items: list[LexicalItem] = Field(default_factory=list)
+
+
 class ExtractWordsResponse(BaseModel):
     unknown_words: list[str]
     total_words: int
@@ -233,10 +260,43 @@ class BatchWordsRequest(BaseModel):
     words: list[str] = Field(default_factory=list)
     items: list[LexicalItem] = Field(default_factory=list)
     enrich_meanings: bool = True
+    is_learned: bool = False
     source_type: str = "manual"
     source_material_id: Optional[str] = None
     source_folder_id: Optional[str] = None
     source_label: Optional[str] = None
+    wordbook_id: Optional[str] = None
+
+
+class IndependentWordbookFolderCreate(BaseModel):
+    user_id: str
+    name: str
+    parent_id: Optional[str] = None
+
+
+class IndependentWordbookFolderUpdate(BaseModel):
+    user_id: str
+    name: Optional[str] = None
+    parent_id: Optional[str] = None
+    update_parent: bool = False
+
+
+class IndependentWordbookCreate(BaseModel):
+    user_id: str
+    name: str
+    folder_id: Optional[str] = None
+
+
+class IndependentWordbookUpdate(BaseModel):
+    user_id: str
+    name: Optional[str] = None
+    folder_id: Optional[str] = None
+    update_folder: bool = False
+
+
+class MaterialDefaultWordbookUpdate(BaseModel):
+    user_id: str
+    wordbook_id: Optional[str] = None
 
 
 class BatchWordResult(BaseModel):

@@ -71,3 +71,14 @@ def get_bytes(key: str) -> bytes:
         Key=key,
     )
     return response["Body"].read()
+
+
+def delete_keys(keys: list[str]) -> None:
+    unique_keys = sorted({key for key in keys if key})
+    if not unique_keys:
+        return
+    _require_object_storage_settings()
+    _client().delete_objects(
+        Bucket=settings.oracle_object_storage_bucket,
+        Delete={"Objects": [{"Key": key} for key in unique_keys], "Quiet": True},
+    )
