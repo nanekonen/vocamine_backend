@@ -31,6 +31,24 @@ async def list_wordbooks(user_id: str = Query(...)):
     books = db.table("wordbooks").select("*").eq("user_id", user_id).order(
         "created_at"
     ).execute().data or []
+    book_ids = [book["id"] for book in books]
+    counts: dict[str, set[int]] = {book_id: set() for book_id in book_ids}
+    if book_ids:
+        registrations = (
+            db.table("wordbook_word_registrations")
+            .select("wordbook_id, wordbook_word_id")
+            .in_("wordbook_id", book_ids)
+            .execute()
+            .data
+            or []
+        )
+        for registration in registrations:
+            book_id = registration.get("wordbook_id")
+            word_id = registration.get("wordbook_word_id")
+            if book_id in counts and word_id is not None:
+                counts[book_id].add(int(word_id))
+    for book in books:
+        book["word_count"] = len(counts.get(book["id"], set()))
     return {"folders": folders, "wordbooks": books}
 
 

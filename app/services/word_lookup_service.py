@@ -640,13 +640,19 @@ async def add_meanings_to_wordbook(
     if existing_by_meaning_id:
         (
             db.table("wordbook_words")
-            .update({"is_learned": is_learned})
+            .update({
+                "is_learned": is_learned,
+            })
             .in_("id", list(existing_by_meaning_id.values()))
             .execute()
         )
 
     rows_to_insert = [
-        {"user_id": user_id, "meaning_id": mid, "is_learned": is_learned}
+        {
+            "user_id": user_id,
+            "meaning_id": mid,
+            "is_learned": is_learned,
+        }
         for mid in meaning_ids
         if mid not in existing_by_meaning_id
     ]
