@@ -449,7 +449,7 @@ async def update_material(material_id: str, payload: MaterialUpdate):
         updates["title"] = title
         # 削除後も表示される出典名を、現在の教材名と揃える。
         try:
-            db.table("wordbook_word_sources").update({"label": title}).eq(
+            db.table("wordbook_word_registrations").update({"label": title}).eq(
                 "material_id", material_id
             ).execute()
         except Exception:
@@ -464,7 +464,7 @@ async def update_material(material_id: str, payload: MaterialUpdate):
                 raise HTTPException(status_code=404, detail="Folder not found.")
         updates["folder_id"] = payload.folder_id
         try:
-            db.table("wordbook_word_sources").update(
+            db.table("wordbook_word_registrations").update(
                 {"folder_id": payload.folder_id}
             ).eq("material_id", material_id).execute()
         except Exception:
@@ -579,7 +579,7 @@ async def delete_material(material_id: str, user_id: str = Query(...)):
     # 教材名を退避することで、削除後も単語帳から由来を確認できるようにする。
     try:
         sources = (
-            db.table("wordbook_word_sources")
+            db.table("wordbook_word_registrations")
             .select("id, wordbook_word_id")
             .eq("material_id", material_id)
             .execute()
@@ -588,7 +588,7 @@ async def delete_material(material_id: str, user_id: str = Query(...)):
         )
         for source in sources:
             existing_response = (
-                db.table("wordbook_word_sources")
+                db.table("wordbook_word_registrations")
                 .select("id")
                 .eq("wordbook_word_id", source["wordbook_word_id"])
                 .eq("source_type", "deleted_material")
@@ -600,12 +600,12 @@ async def delete_material(material_id: str, user_id: str = Query(...)):
             # とき APIResponse(data=None) ではなく None 自体を返す。
             existing = getattr(existing_response, "data", None)
             if existing:
-                db.table("wordbook_word_sources").delete().eq(
+                db.table("wordbook_word_registrations").delete().eq(
                     "id", source["id"]
                 ).execute()
             else:
                 (
-                    db.table("wordbook_word_sources")
+                    db.table("wordbook_word_registrations")
                     .update({
                         "source_type": "deleted_material",
                         "material_id": None,

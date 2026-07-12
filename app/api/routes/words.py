@@ -1,4 +1,5 @@
 from __future__ import annotations
+from time import perf_counter
 from typing import Optional
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Response
 from app.db.supabase import get_supabase
@@ -7,6 +8,7 @@ from app.schemas.schemas import (
     WordbookWordCreate, WordbookWordUpdate, WordbookWordResponse,
     ExtractWordsRequest, ExtractWordsResponse,
     StoredMeaningsRequest,
+    RegenerateJapaneseRequest,
     BatchWordsRequest, BatchWordsResponse, BatchWordResult,
 )
 from app.services.word_service import enrich_lexical_items, extract_unknown_words
@@ -14,7 +16,8 @@ from app.services.word_lookup_service import (
     get_or_create_word,
     get_word_with_meanings,
     add_meanings_to_wordbook,
-    record_wordbook_source,
+    record_wordbook_registration,
+    regenerate_missing_japanese_definitions,
 )
 from app.services.dictionary_service import normalize_part_of_speech
 from app.services.user_identity_service import resolve_user_id
@@ -23,26 +26,16 @@ from app.services.pronunciation_service import get_pronunciation_audio
 router = APIRouter(prefix="/words", tags=["Words"])
 
 
-def add_entries_to_independent_wordbook(
-    user_id: str,
-    wordbook_id: Optional[str],
-    wordbook_word_ids: list[int],
-) -> None:
-    if not wordbook_id or not wordbook_word_ids:
+def validate_owned_wordbook(user_id: str, wordbook_id: Optional[str]) -> None:
+    if not wordbook_id:
         return
-    db = get_supabase()
-    owned = db.table("wordbooks").select("id").eq("id", wordbook_id).eq(
-        "user_id", user_id
-    ).maybe_single().execute().data
+    owned = (
+        get_supabase().table("wordbooks").select("id")
+        .eq("id", wordbook_id).eq("user_id", user_id)
+        .maybe_single().execute().data
+    )
     if not owned:
         raise HTTPException(status_code=404, detail="Wordbook not found.")
-    db.table("wordbook_memberships").upsert(
-        [
-            {"wordbook_id": wordbook_id, "wordbook_word_id": entry_id}
-            for entry_id in wordbook_word_ids
-        ],
-        on_conflict="wordbook_id,wordbook_word_id",
-    ).execute()
 
 
 # ── Word 登録 ─────────────────────────────────────────────────────────────────
@@ -100,8 +93,34 @@ async def get_stored_meanings(payload: StoredMeaningsRequest):
     return response.data or []
 
 
+@router.post("/regenerate-missing-japanese")
+async def regenerate_missing_japanese(payload: RegenerateJapaneseRequest):
+    updated = await regenerate_missing_japanese_definitions(payload.meaning_ids)
+    return {"requested": len(set(payload.meaning_ids)), "updated": updated}
+
+
+@router.get("/pronunciation")
+async def pronunciation_direct(
+    word: str = Query(..., min_length=1),
+    ipa: Optional[str] = Query(default=None),
+):
+    """フロントが保持する語とIPAから直接生成し、DB待ち時間を発生させない。"""
+    started = perf_counter()
+    try:
+        audio = await get_pronunciation_audio(word, ipa)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Piper synthesis failed: {exc}") from exc
+    done = perf_counter()
+    return Response(
+        content=audio,
+        media_type="audio/wav",
+        headers={"Server-Timing": f"audio;dur={(done - started) * 1000:.1f}"},
+    )
+
+
 @router.get("/pronunciation/{meaning_id}")
 async def pronunciation(meaning_id: int):
+    started = perf_counter()
     meaning = (
         get_supabase()
         .table("meanings")
@@ -113,12 +132,23 @@ async def pronunciation(meaning_id: int):
     if not meaning or not meaning.data:
         raise HTTPException(status_code=404, detail="Meaning not found.")
     row = meaning.data
+    db_done = perf_counter()
     word = (row.get("words") or {}).get("word") or ""
     try:
         audio = await get_pronunciation_audio(word, row.get("ipa"))
     except Exception as exc:
         raise HTTPException(status_code=503, detail=f"Piper synthesis failed: {exc}") from exc
-    return Response(content=audio, media_type="audio/wav")
+    synthesis_done = perf_counter()
+    return Response(
+        content=audio,
+        media_type="audio/wav",
+        headers={
+            "Server-Timing": (
+                f"db;dur={(db_done - started) * 1000:.1f}, "
+                f"audio;dur={(synthesis_done - db_done) * 1000:.1f}"
+            )
+        },
+    )
 
 
 @router.get("/distractors", response_model=list[MeaningResponse])
@@ -164,6 +194,7 @@ async def add_words_batch(payload: BatchWordsRequest):
     """
     results: list[BatchWordResult] = []
     user_id = resolve_user_id(payload.user_id)
+    validate_owned_wordbook(user_id, payload.wordbook_id)
     registered_count = 0
     skipped_no_meaning_count = 0
 
@@ -215,8 +246,8 @@ async def add_words_batch(payload: BatchWordsRequest):
             source_folder_id=payload.source_folder_id,
             source_label=payload.source_label,
             is_learned=payload.is_learned,
+            wordbook_id=payload.wordbook_id,
         )
-        add_entries_to_independent_wordbook(user_id, payload.wordbook_id, added_ids)
         registered_count += 1
         results.append(BatchWordResult(
             word=word,
@@ -247,28 +278,34 @@ async def get_wordbook(
     """ユーザーの単語帳を取得（is_learnedでフィルタ可能）"""
     user_id = resolve_user_id(user_id)
     db = get_supabase()
-    def build_query(include_sources: bool):
+    def build_query(include_registrations: bool):
         select = "*, meanings(*, words(*), example_sentences(*))"
-        if wordbook_id:
-            select += ", wordbook_memberships!inner(wordbook_id)"
-        if include_sources:
-            select += ", wordbook_word_sources(*)"
+        if include_registrations:
+            join = "!inner" if wordbook_id else ""
+            select += f", wordbook_word_registrations{join}(*)"
         query = db.table("wordbook_words").select(select).eq("user_id", user_id)
         if is_learned is not None:
             query = query.eq("is_learned", is_learned)
         if wordbook_id:
-            query = query.eq("wordbook_memberships.wordbook_id", wordbook_id)
+            query = query.eq("wordbook_word_registrations.wordbook_id", wordbook_id)
         return query.order("created_at", desc=True)
 
     include_sources = True
     try:
-        response = build_query(include_sources=True).execute()
+        response = build_query(include_registrations=True).execute()
     except Exception:
         include_sources = False
-        response = build_query(include_sources=False).execute()
+        response = build_query(include_registrations=False).execute()
     rows = []
     for row in response.data or []:
-        sources = row.pop("wordbook_word_sources", []) or []
+        sources = row.pop("wordbook_word_registrations", []) or []
+        if wordbook_id:
+            # PostgRESTのembedded filter挙動に依存せず、現在表示中の
+            # 単語帳へ登録された履歴だけを返す。
+            sources = [
+                source for source in sources
+                if source.get("wordbook_id") == wordbook_id
+            ]
         if not include_sources and (source_type or source_material_id or source_folder_id):
             continue
         if source_type and not any(source.get("source_type") == source_type for source in sources):
@@ -286,6 +323,7 @@ async def get_wordbook(
 async def add_to_wordbook(user_id: str, payload: WordbookWordCreate):
     """meaning_idを単語帳（未学習）に追加する"""
     user_id = resolve_user_id(user_id)
+    validate_owned_wordbook(user_id, payload.wordbook_id)
     db = get_supabase()
     try:
         meaning = (
@@ -311,15 +349,13 @@ async def add_to_wordbook(user_id: str, payload: WordbookWordCreate):
                 .eq("id", existing.data[0]["id"])
                 .execute()
             )
-            record_wordbook_source(
+            record_wordbook_registration(
                 existing.data[0]["id"],
+                wordbook_id=payload.wordbook_id,
                 source_type=payload.source_type,
                 source_material_id=payload.source_material_id,
                 source_folder_id=payload.source_folder_id,
                 source_label=payload.source_label,
-            )
-            add_entries_to_independent_wordbook(
-                user_id, payload.wordbook_id, [existing.data[0]["id"]]
             )
             return updated.data[0] if updated.data else existing.data[0]
         response = db.table("wordbook_words").insert({
@@ -327,15 +363,13 @@ async def add_to_wordbook(user_id: str, payload: WordbookWordCreate):
             "meaning_id": payload.meaning_id,
             "is_learned": False,
         }).execute()
-        record_wordbook_source(
+        record_wordbook_registration(
             response.data[0]["id"],
+            wordbook_id=payload.wordbook_id,
             source_type=payload.source_type,
             source_material_id=payload.source_material_id,
             source_folder_id=payload.source_folder_id,
             source_label=payload.source_label,
-        )
-        add_entries_to_independent_wordbook(
-            user_id, payload.wordbook_id, [response.data[0]["id"]]
         )
         return response.data[0]
     except HTTPException:

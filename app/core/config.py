@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     app_env: str = "development"
     piper_http_url: str = "http://127.0.0.1:5001"
     piper_voice: str = "en_US-lessac-medium"
+    piper_model_path: str = "en_US-lessac-medium.onnx"
     piper_audio_cache_dir: str = ".cache/piper_audio"
     cors_origins: List[str] = ["http://localhost:3000"]
     oracle_object_storage_namespace: str = Field(

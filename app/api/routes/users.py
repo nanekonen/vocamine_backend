@@ -18,14 +18,22 @@ async def setup_level(user_id: str, payload: LevelSetupRequest):
 
     # users テーブルに upsert
     db.table("users").upsert(
-        {"id": user_id, "level": payload.level},
+        {
+            "id": user_id,
+            "level": payload.level,
+            "username": payload.username.strip(),
+        },
         on_conflict="id"
     ).execute()
 
     # CEFR-J 単語を学習済みとして一括登録
     count = await bulk_register_cefr_words(user_id, payload.level)
 
-    return {"level": payload.level, "registered_words": count}
+    return {
+        "level": payload.level,
+        "username": payload.username.strip(),
+        "registered_words": count,
+    }
 
 
 @router.put("/{user_id}/level", response_model=UserResponse)

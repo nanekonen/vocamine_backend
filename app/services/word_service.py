@@ -16,7 +16,7 @@ from app.services.word_lookup_service import (
     batch_generate_missing_japanese_definitions,
     ensure_meanings_for_word,
     get_or_create_word,
-    record_wordbook_source,
+    record_wordbook_registration,
 )
 
 # ユーザーレベル → CEFR-J tier の上限マッピング
@@ -35,7 +35,7 @@ LEVEL_TIER_MAP: dict[str, int] = {
     "TOEIC 990点":    6,
 }
 
-# meanings.tier → wordbook_word_sources.source_type
+# meanings.tier → wordbook_word_registrations.source_type
 # tier 5, 6 に対応するCEFR-Jファイルは現状シードされていないため、
 # 該当時は "initial_level" にフォールバックする。
 CEFR_TIER_SOURCE_TYPES: dict[int, str] = {
@@ -661,7 +661,7 @@ async def bulk_register_cefr_words(user_id: str, level: str) -> int:
             "initial_level",
         )
 
-        record_wordbook_source(
+        record_wordbook_registration(
             row["id"],
             source_type=source_type,
             source_label=level,

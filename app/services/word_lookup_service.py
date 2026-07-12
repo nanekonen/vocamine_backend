@@ -512,8 +512,57 @@ def get_word_with_meanings(word_id: int) -> dict:
     return result
 
 
-def record_wordbook_source(
+async def regenerate_missing_japanese_definitions(
+    meaning_ids: list[int], chunk_size: int = 20
+) -> int:
+    """指定された語義のうち日本語訳が空のものだけをGeminiで再生成する。"""
+    ids = sorted(set(meaning_ids))
+    if not ids:
+        return 0
+    db = get_supabase()
+    rows = (
+        db.table("meanings")
+        .select(
+            "id, part_of_speech, definition_en, definition_ja, "
+            "transitivity, countability, words(word)"
+        )
+        .in_("id", ids)
+        .execute()
+        .data
+        or []
+    )
+    requests = []
+    for row in rows:
+        if (row.get("definition_ja") or "").strip():
+            continue
+        word = (row.get("words") or {}).get("word") or ""
+        if not word:
+            continue
+        requests.append({
+            "id": f"meaning:{row['id']}",
+            "term": word,
+            "part_of_speech": row.get("part_of_speech"),
+            "definition_en": row.get("definition_en"),
+            "transitivity": row.get("transitivity"),
+            "countability": row.get("countability"),
+        })
+    updated = 0
+    for start in range(0, len(requests), chunk_size):
+        generated = await generate_japanese_definitions_batch(
+            requests[start:start + chunk_size]
+        )
+        for request_id, definition in generated.items():
+            meaning_id = int(request_id.split(":", 1)[1])
+            db.table("meanings").update({"definition_ja": definition}).eq(
+                "id", meaning_id
+            ).execute()
+            updated += 1
+    return updated
+
+
+def record_wordbook_registration(
     wordbook_word_id: int,
+    wordbook_id: Optional[str] = None,
     source_type: str = "manual",
     source_material_id: Optional[str] = None,
     source_folder_id: Optional[str] = None,
@@ -523,19 +572,21 @@ def record_wordbook_source(
     source = source_type.strip() or "manual"
     try:
         query = (
-            db.table("wordbook_word_sources")
+            db.table("wordbook_word_registrations")
             .select("id")
             .eq("wordbook_word_id", wordbook_word_id)
             .eq("source_type", source)
         )
+        query = query.eq("wordbook_id", wordbook_id) if wordbook_id else query.is_("wordbook_id", "null")
         query = query.eq("material_id", source_material_id) if source_material_id else query.is_("material_id", "null")
         query = query.eq("folder_id", source_folder_id) if source_folder_id else query.is_("folder_id", "null")
         query = query.eq("label", source_label) if source_label else query.is_("label", "null")
         if query.limit(1).execute().data:
             return
-        db.table("wordbook_word_sources").insert(
+        db.table("wordbook_word_registrations").insert(
             {
                 "wordbook_word_id": wordbook_word_id,
+                "wordbook_id": wordbook_id,
                 "source_type": source,
                 "material_id": source_material_id,
                 "folder_id": source_folder_id,
@@ -556,6 +607,7 @@ async def add_meanings_to_wordbook(
     source_folder_id: Optional[str] = None,
     source_label: Optional[str] = None,
     is_learned: bool = False,
+    wordbook_id: Optional[str] = None,
 ) -> list[int]:
     """
     指定した word_id の全 meaning を、ユーザーの単語帳に「未学習」として追加する。
@@ -607,8 +659,9 @@ async def add_meanings_to_wordbook(
             existing_by_meaning_id[row["meaning_id"]] = row["id"]
 
     for wordbook_word_id in existing_by_meaning_id.values():
-        record_wordbook_source(
+        record_wordbook_registration(
             wordbook_word_id,
+            wordbook_id=wordbook_id,
             source_type=source_type,
             source_material_id=source_material_id,
             source_folder_id=source_folder_id,

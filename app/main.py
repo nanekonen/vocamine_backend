@@ -1,12 +1,22 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.api.routes import auth, materials, ocr, words, users, wordbooks
+from app.services.pronunciation_service import initialize_pronunciation_model
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    await initialize_pronunciation_model()
+    yield
 
 app = FastAPI(
     title="Vocamine API",
     description="教材から未知単語を抽出し単語帳を管理するバックエンド",
     version="0.1.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(

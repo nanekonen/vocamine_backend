@@ -244,6 +244,10 @@ class StoredMeaningsRequest(BaseModel):
     items: list[LexicalItem] = Field(default_factory=list)
 
 
+class RegenerateJapaneseRequest(BaseModel):
+    meaning_ids: list[int] = Field(default_factory=list)
+
+
 class ExtractWordsResponse(BaseModel):
     unknown_words: list[str]
     total_words: int
@@ -322,12 +326,14 @@ class UserLevelUpdate(BaseModel):
 class UserResponse(BaseModel):
     id: str
     level: str
+    username: str
     updated_at: datetime
 
 
 # --- Level setup ---
 class LevelSetupRequest(BaseModel):
     level: str
+    username: str
 
 
 # --- Auth ---
@@ -338,4 +344,6 @@ class AuthSessionRequest(BaseModel):
 class AuthSessionResponse(BaseModel):
     user_id: str
     email: Optional[str] = None
+    username: Optional[str] = None
+    level: Optional[str] = None
     setup_completed: bool = False

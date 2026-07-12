@@ -698,9 +698,17 @@ async def generate_japanese_definitions_batch(requests: list[dict]) -> dict[str,
         f"{settings.gemini_model}:generateContent?key={settings.gemini_api_key}"
     )
     async with httpx.AsyncClient(timeout=45.0) as client:
-        response = await client.post(url, json=payload)
+        try:
+            response = await client.post(url, json=payload)
+        except httpx.HTTPError as exc:
+            print(f"[gemini-batch] request failed: {exc!r}")
+            return {}
 
     if response.status_code != 200:
+        print(
+            f"[gemini-batch] status={response.status_code} "
+            f"body={response.text[:500]}"
+        )
         return {}
 
     data = response.json()
@@ -717,6 +725,7 @@ async def generate_japanese_definitions_batch(requests: list[dict]) -> dict[str,
     try:
         parsed = json.loads(text)
     except json.JSONDecodeError:
+        print(f"[gemini-batch] invalid JSON: {text[:500]}")
         return {}
     if not isinstance(parsed, dict):
         return {}
