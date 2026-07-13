@@ -231,7 +231,7 @@ async def list_materials(user_id: str = Query(...)):
         db.table("materials")
         .select("*")
         .eq("user_id", user_id)
-        .order("created_at", desc=True)
+        .order("created_at", desc=False)
         .execute()
         .data
         or []

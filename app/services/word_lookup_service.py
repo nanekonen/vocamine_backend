@@ -619,11 +619,17 @@ async def add_meanings_to_wordbook(
         db.table("meanings")
         .select("id")
         .eq("word_id", word_id)
+        .filter("definition_ja", "not.is", "null")
+        .neq("definition_ja", "")
     )
     normalized_pos = normalize_part_of_speech(part_of_speech)
     if normalized_pos:
         query = query.eq("part_of_speech", normalized_pos)
-    meanings = query.execute().data
+    # 同じ単語・同じ品詞に複数の意味がある場合、画面上で先頭になる
+    # 最小IDのmeaningだけを単語帳へ登録する。
+    # spaCy由来の品詞詳細がDBになくても、それを包含する
+    # meanings.part_of_speech が一致する先頭meaningへマッチさせる。
+    meanings = query.order("id").limit(1).execute().data
     if not meanings:
         return []
 

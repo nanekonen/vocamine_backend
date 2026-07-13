@@ -11,7 +11,10 @@ from app.schemas.schemas import (
     RegenerateJapaneseRequest,
     BatchWordsRequest, BatchWordsResponse, BatchWordResult,
 )
-from app.services.word_service import enrich_lexical_items, extract_unknown_words
+from app.services.word_service import (
+    enrich_lexical_items_background,
+    extract_unknown_words,
+)
 from app.services.word_lookup_service import (
     get_or_create_word,
     get_word_with_meanings,
@@ -155,22 +158,25 @@ async def add_words_batch(payload: BatchWordsRequest):
     results: list[BatchWordResult] = []
     user_id = resolve_user_id(payload.user_id)
     validate_owned_wordbook(user_id, payload.wordbook_id)
-    registered_count = 0
+    registered_wordbook_word_ids: set[int] = set()
     skipped_no_meaning_count = 0
 
-    seen: set[tuple[str, Optional[str]]] = set()
-    unique_items: list[tuple[str, Optional[str]]] = []
-    raw_items = [(item.text, item.part_of_speech.value) for item in payload.items]
-    raw_items.extend((word, None) for word in payload.words)
-    for w, pos in raw_items:
+    seen: set[tuple[str, Optional[str], Optional[str]]] = set()
+    unique_items: list[tuple[str, Optional[str], Optional[str]]] = []
+    raw_items = [
+        (item.text, item.part_of_speech.value, item.part_of_speech_detail)
+        for item in payload.items
+    ]
+    raw_items.extend((word, None, None) for word in payload.words)
+    for w, pos, pos_detail in raw_items:
         lower = w.strip().lower()
         normalized_pos = normalize_part_of_speech(pos)
-        key = (lower, normalized_pos)
+        key = (lower, normalized_pos, pos_detail)
         if lower and key not in seen:
             seen.add(key)
             unique_items.append(key)
 
-    for word, part_of_speech in unique_items:
+    for word, part_of_speech, _part_of_speech_detail in unique_items:
         try:
             lookup = await get_or_create_word(
                 word,
@@ -208,7 +214,8 @@ async def add_words_batch(payload: BatchWordsRequest):
             is_learned=payload.is_learned,
             wordbook_id=payload.wordbook_id,
         )
-        registered_count += 1
+        if added_ids:
+            registered_wordbook_word_ids.update(added_ids)
         results.append(BatchWordResult(
             word=word,
             part_of_speech=part_of_speech,
@@ -218,7 +225,7 @@ async def add_words_batch(payload: BatchWordsRequest):
 
     return BatchWordsResponse(
         total=len(unique_items),
-        registered_count=registered_count,
+        registered_count=len(registered_wordbook_word_ids),
         skipped_no_meaning_count=skipped_no_meaning_count,
         results=results,
     )
@@ -288,18 +295,33 @@ async def add_to_wordbook(user_id: str, payload: WordbookWordCreate):
     try:
         meaning = (
             db.table("meanings")
-            .select("id")
+            .select("id, word_id, part_of_speech")
             .eq("id", payload.meaning_id)
             .maybe_single()
             .execute()
         )
         if not meaning.data:
             raise HTTPException(status_code=404, detail="Meaning not found.")
+        canonical_query = (
+            db.table("meanings")
+            .select("id")
+            .eq("word_id", meaning.data["word_id"])
+        )
+        part_of_speech = meaning.data.get("part_of_speech")
+        canonical_query = (
+            canonical_query.eq("part_of_speech", part_of_speech)
+            if part_of_speech
+            else canonical_query.is_("part_of_speech", "null")
+        )
+        canonical = (
+            canonical_query.order("id").limit(1).execute().data or []
+        )
+        meaning_id = canonical[0]["id"] if canonical else payload.meaning_id
         existing = (
             db.table("wordbook_words")
             .select("id")
             .eq("user_id", user_id)
-            .eq("meaning_id", payload.meaning_id)
+            .eq("meaning_id", meaning_id)
             .execute()
         )
         if existing.data:
@@ -320,7 +342,7 @@ async def add_to_wordbook(user_id: str, payload: WordbookWordCreate):
             return updated.data[0] if updated.data else existing.data[0]
         response = db.table("wordbook_words").insert({
             "user_id": user_id,
-            "meaning_id": payload.meaning_id,
+            "meaning_id": meaning_id,
             "is_learned": False,
         }).execute()
         record_wordbook_registration(
@@ -375,5 +397,5 @@ async def extract_words(payload: ExtractWordsRequest, background_tasks: Backgrou
         enrich_meanings=payload.enrich_meanings,
     )
     if payload.background_enrich_meanings and not payload.enrich_meanings:
-        background_tasks.add_task(enrich_lexical_items, result["items"])
+        background_tasks.add_task(enrich_lexical_items_background, result["items"])
     return ExtractWordsResponse(**result)

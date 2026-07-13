@@ -44,9 +44,9 @@ async def list_wordbooks(user_id: str = Query(...)):
         )
         for registration in registrations:
             book_id = registration.get("wordbook_id")
-            word_id = registration.get("wordbook_word_id")
-            if book_id in counts and word_id is not None:
-                counts[book_id].add(int(word_id))
+            wordbook_word_id = registration.get("wordbook_word_id")
+            if book_id in counts and wordbook_word_id is not None:
+                counts[book_id].add(int(wordbook_word_id))
     for book in books:
         book["word_count"] = len(counts.get(book["id"], set()))
     return {"folders": folders, "wordbooks": books}

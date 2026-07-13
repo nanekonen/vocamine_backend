@@ -300,10 +300,15 @@ def _map_spacy_pos(token) -> tuple[Optional[str], Optional[str]]:
 
 
 def _dedupe_items(items: list[dict]) -> list[dict]:
+    # 同じ単語・品詞でも文法上の役割と本文位置が異なるものは別カードにする。
     seen: set[tuple[str, str, Optional[str]]] = set()
     result: list[dict] = []
     for item in items:
-        key = (item["text"], item["part_of_speech"], item.get("part_of_speech_detail"))
+        key = (
+            item["text"],
+            item["part_of_speech"],
+            item.get("part_of_speech_detail"),
+        )
         if key in seen:
             for existing in result:
                 if (
@@ -325,7 +330,7 @@ def _dedupe_items(items: list[dict]) -> list[dict]:
     return result
 
 
-async def get_learned_lexical_items(user_id: str) -> set[tuple[str, str]]:
+def get_learned_lexical_items(user_id: str) -> set[tuple[str, str]]:
     db = get_supabase()
     learned: set[tuple[str, str]] = set()
     page_size = 1000
@@ -377,7 +382,7 @@ def _phrase_catalog() -> list[str]:
     return sorted(phrases, key=lambda p: len(p.split()), reverse=True)
 
 
-async def analyze_lexical_items(text: str) -> list[dict]:
+def analyze_lexical_items(text: str) -> list[dict]:
     nlp = _get_spacy_nlp()
     doc = nlp(text)
     if not doc:
@@ -490,15 +495,59 @@ def pos_matches(material_pos: str, learned_pos: str) -> bool:
     return learned_pos in POS_SUPERTYPES.get(material_pos, {material_pos})
 
 
+def _meaning_keys_with_japanese(items: list[dict]) -> set[tuple[str, str]]:
+    """保存済み日本語訳の有無を単語ごとのN+1ではなく一括取得する。"""
+    db = get_supabase()
+    words = sorted({
+        item["text"].strip().lower().replace("’", "'")
+        for item in items
+        if item.get("text")
+    })
+    if not words:
+        return set()
+
+    word_ids: dict[int, str] = {}
+    chunk_size = 200
+    for start in range(0, len(words), chunk_size):
+        rows = (
+            db.table("words")
+            .select("id, word")
+            .in_("word", words[start:start + chunk_size])
+            .execute()
+            .data
+            or []
+        )
+        for row in rows:
+            word_ids[int(row["id"])] = str(row.get("word") or "").strip().lower()
+
+    result: set[tuple[str, str]] = set()
+    ids = list(word_ids)
+    for start in range(0, len(ids), chunk_size):
+        rows = (
+            db.table("meanings")
+            .select("word_id, part_of_speech")
+            .in_("word_id", ids[start:start + chunk_size])
+            .filter("definition_ja", "not.is", "null")
+            .neq("definition_ja", "")
+            .execute()
+            .data
+            or []
+        )
+        for row in rows:
+            word = word_ids.get(int(row["word_id"]))
+            pos = str(row.get("part_of_speech") or "")
+            if word and pos:
+                result.add((word, pos))
+    return result
+
+
 async def extract_unknown_words(text: str, user_id: str, enrich_meanings: bool = True) -> dict:
     """
     テキスト中の英単語のうち、学習済み単語帳に存在しないものを返す。
     判定: wordbook_words に is_learned=true のエントリーがない単語 = 未知
     """
-    lexical_items = await analyze_lexical_items(text)
-    total = len(lexical_items)
-
-    if total == 0:
+    lexical_items = await asyncio.to_thread(analyze_lexical_items, text)
+    if not lexical_items:
         return {
             "unknown_words": [],
             "total_words": 0,
@@ -509,7 +558,12 @@ async def extract_unknown_words(text: str, user_id: str, enrich_meanings: bool =
             "unknown_items": [],
         }
 
-    learned = await get_learned_lexical_items(user_id)
+    learned = await asyncio.to_thread(get_learned_lexical_items, user_id)
+    stored_meaning_keys = (
+        set()
+        if enrich_meanings
+        else await asyncio.to_thread(_meaning_keys_with_japanese, lexical_items)
+    )
     item_results: list[dict] = []
     unknown_items: list[dict] = []
 
@@ -523,7 +577,8 @@ async def extract_unknown_words(text: str, user_id: str, enrich_meanings: bool =
             for learned_word, learned_pos in learned
         )
 
-        has_meaning = False
+        # enrich_meanings=false の高速解析でも、保存済みの日本語訳があるかは
+        # 必ず確認する。_count_meanings は definition_ja が空のmeaningを数えない。
         if enrich_meanings:
             lookup = await get_or_create_word(
                 item["text"],
@@ -531,6 +586,8 @@ async def extract_unknown_words(text: str, user_id: str, enrich_meanings: bool =
                 enrich_meanings=not is_learned,
             )
             has_meaning = lookup["meaning_count"] > 0
+        else:
+            has_meaning = (word, material_pos) in stored_meaning_keys
 
         result = {
             **item,
@@ -538,11 +595,13 @@ async def extract_unknown_words(text: str, user_id: str, enrich_meanings: bool =
             "has_meaning": has_meaning,
         }
         item_results.append(result)
-        if not is_learned:
+        if not is_learned and has_meaning:
             unknown_items.append(result)
 
     unknown_count = len(unknown_items)
-    known_count = total - unknown_count
+    known_count = sum(1 for item in item_results if item["is_learned"])
+    # 日本語訳を取得できていない語は、既知・未知・習得率の分母から除外する。
+    total = known_count + unknown_count
     coverage_rate = round(known_count / total, 4) if total else 0.0
 
     return {
@@ -587,6 +646,15 @@ async def enrich_lexical_items(items: list[dict]) -> None:
         except Exception:
             continue
     await batch_generate_missing_japanese_definitions(items)
+
+
+def enrich_lexical_items_background(items: list[dict]) -> None:
+    """FastAPIのthread poolで意味補完を動かし、API全体を停止させない。"""
+    try:
+        asyncio.run(enrich_lexical_items(items))
+    except Exception as exc:
+        # レスポンス送信後の補完失敗をASGIリクエスト例外にしない。
+        print(f"[background-enrichment] failed: {exc!r}")
 
 
 async def bulk_register_cefr_words(user_id: str, level: str) -> int:
@@ -668,3 +736,11 @@ async def bulk_register_cefr_words(user_id: str, level: str) -> int:
         )
 
     return len(upsert_rows)
+
+
+def bulk_register_cefr_words_background(user_id: str, level: str) -> None:
+    """初期語彙登録をthread poolで実行し、レベル設定画面を待たせない。"""
+    try:
+        asyncio.run(bulk_register_cefr_words(user_id, level))
+    except Exception as exc:
+        print(f"[background-level-registration] failed: {exc!r}")
