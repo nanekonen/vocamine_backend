@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 import spacy
-from spacy.matcher import PhraseMatcher
+from spacy.matcher import DependencyMatcher, PhraseMatcher
 from spacy.util import filter_spans
 
 from app.db.supabase import get_supabase
@@ -83,6 +83,28 @@ QUANTIFIER_WORDS = {
     "no",
     "several",
     "some",
+}
+DIRECT_OBJECT_DEPENDENCIES = {"dobj", "obj"}
+PHRASE_TRAILING_PREPOSITIONS = {
+    "about",
+    "against",
+    "at",
+    "by",
+    "for",
+    "from",
+    "in",
+    "into",
+    "of",
+    "on",
+    "over",
+    "through",
+    "to",
+    "toward",
+    "towards",
+    "under",
+    "upon",
+    "with",
+    "without",
 }
 _LEXICAL_ENRICHMENT_LOCK = asyncio.Lock()
 
@@ -325,6 +347,101 @@ def _dedupe_items(items: list[dict]) -> list[dict]:
     return result
 
 
+def _dependency_phrase_patterns(
+    phrase_texts: list[str],
+) -> dict[tuple[str, str], list[tuple[str, Optional[str]]]]:
+    """動詞＋目的語として照合できる熟語を、原形の組で索引化する。"""
+    patterns: dict[tuple[str, str], list[tuple[str, Optional[str]]]] = {}
+    for phrase in phrase_texts:
+        normalized = _normalize_phrase_text(phrase)
+        words = normalized.split()
+        if len(words) not in {2, 3} or not all(
+            _is_english_word_text(word) for word in words
+        ):
+            continue
+
+        trailing_preposition: Optional[str] = None
+        if len(words) == 3:
+            if words[2] not in PHRASE_TRAILING_PREPOSITIONS:
+                continue
+            trailing_preposition = words[2]
+
+        key = (words[0], words[1])
+        pattern = (normalized, trailing_preposition)
+        if pattern not in patterns.setdefault(key, []):
+            patterns[key].append(pattern)
+
+    return patterns
+
+
+def _attached_preposition(verb, obj, lemma: str):
+    """動詞または目的語に係り、目的語より後ろにある指定前置詞を返す。"""
+    for token in (*verb.children, *obj.children):
+        if (
+            token.i > obj.i
+            and token.pos_ == "ADP"
+            and token.dep_ == "prep"
+            and _normalize_lemma(token) == lemma
+        ):
+            return token
+    return None
+
+
+def _dependency_phrase_items(doc, phrase_texts: list[str]) -> list[dict]:
+    """本文の動詞と直接目的語の係り受けから、非連続を含む熟語を検出する。"""
+    patterns = _dependency_phrase_patterns(phrase_texts)
+    items: list[dict] = []
+    matcher = DependencyMatcher(doc.vocab)
+    matcher.add("VERB_DIRECT_OBJECT", [[
+        {
+            "RIGHT_ID": "verb",
+            "RIGHT_ATTRS": {"POS": {"IN": ["VERB", "AUX"]}},
+        },
+        {
+            "LEFT_ID": "verb",
+            "REL_OP": ">",
+            "RIGHT_ID": "object",
+            "RIGHT_ATTRS": {
+                "DEP": {"IN": sorted(DIRECT_OBJECT_DEPENDENCIES)},
+                "POS": {"IN": ["NOUN", "PROPN", "PRON"]},
+            },
+        },
+    ]])
+
+    for _, token_ids in matcher(doc):
+        verb, obj = (doc[token_id] for token_id in token_ids)
+        verb_lemma = _normalize_lemma(verb)
+        if obj.i <= verb.i:
+            continue
+
+        key = (verb_lemma, _normalize_lemma(obj))
+        for canonical, trailing_preposition in patterns.get(key, []):
+            last_token = obj
+            if trailing_preposition:
+                prep = _attached_preposition(verb, obj, trailing_preposition)
+                if prep is None:
+                    continue
+                last_token = prep
+
+            span = doc[verb.i:last_token.i + 1]
+            surface = span.text.lower()
+            items.append({
+                "text": canonical,
+                "part_of_speech": PartOfSpeech.phrase.value,
+                "part_of_speech_detail": None,
+                "surface_forms": [surface],
+                "occurrences": [{
+                    "form": surface,
+                    "start": span.start_char,
+                    "end": span.end_char,
+                }],
+                "kind": "phrase",
+                "occurrence_count": 1,
+            })
+
+    return items
+
+
 def get_learned_lexical_items(user_id: str) -> set[tuple[str, str]]:
     db = get_supabase()
     learned: set[tuple[str, str]] = set()
@@ -386,7 +503,19 @@ def analyze_lexical_items(text: str) -> list[dict]:
         return []
 
     phrase_texts = _phrase_catalog()
-    items: list[dict] = []
+    # 動詞＋目的語型は係り受けを正とし、活用形や間に入る修飾語も検出する。
+    # PhraseMatcherは、構文解析が失敗した場合とその他の連続熟語のフォールバック。
+    dependency_items = _dependency_phrase_items(doc, phrase_texts)
+    items: list[dict] = list(dependency_items)
+    dependency_occurrences = {
+        (
+            item["text"],
+            occurrence["start"],
+            occurrence["end"],
+        )
+        for item in dependency_items
+        for occurrence in item["occurrences"]
+    }
 
     if phrase_texts:
         matcher = PhraseMatcher(nlp.vocab, attr="LOWER")
@@ -396,8 +525,11 @@ def analyze_lexical_items(text: str) -> list[dict]:
         )
         spans = filter_spans([doc[start:end] for _, start, end in matcher(doc)])
         for span in spans:
+            canonical = _normalize_phrase_text(span.text)
+            if (canonical, span.start_char, span.end_char) in dependency_occurrences:
+                continue
             items.append({
-                "text": span.text.lower(),
+                "text": canonical,
                 "part_of_speech": PartOfSpeech.phrase.value,
                 "part_of_speech_detail": None,
                 "surface_forms": [span.text.lower()],
