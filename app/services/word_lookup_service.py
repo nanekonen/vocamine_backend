@@ -13,16 +13,28 @@ from app.services.dictionary_service import (
 
 JAPANESE_TEXT_RE = re.compile(r"[ぁ-んァ-ン一-龯]")
 ENGLISH_WORD_RE = re.compile(r"^[a-z]+(?:['’-][a-z]+)*$", re.IGNORECASE)
-NON_WORD_FALLBACK_TERMS = {
-    "http",
-    "https",
-    "www",
-    "com",
-    "org",
-    "net",
-    "pdf",
-}
 _wiktionary_entry_cache: dict[str, bool] = {}
+
+MEANING_POS_COMPATIBILITY: dict[str, set[str]] = {
+    "noun": {"noun", "pronoun", "abbreviation"},
+    "pronoun": {"pronoun", "noun", "determiner"},
+    "verb": {"verb", "auxiliary"},
+    "auxiliary": {"auxiliary", "verb"},
+    "article": {"article", "determiner"},
+    "determiner": {
+        "determiner", "article", "pronoun", "adjective", "numeral",
+    },
+    "adjective": {"adjective", "determiner"},
+    "numeral": {"numeral", "determiner"},
+    "abbreviation": {"abbreviation", "noun"},
+}
+
+
+def _meaning_pos_matches(detected_pos: str, meaning_pos: str) -> bool:
+    return meaning_pos in MEANING_POS_COMPATIBILITY.get(
+        detected_pos,
+        {detected_pos},
+    )
 
 AUXILIARY_MEANINGS = {
     "be": {
@@ -107,16 +119,13 @@ def _definition_contains_japanese(value: Optional[str]) -> bool:
     return bool(value and JAPANESE_TEXT_RE.search(value))
 
 
-def _is_safe_gemini_fallback_term(word: str) -> bool:
+def _has_english_term_shape(word: str) -> bool:
     normalized = word.strip().lower()
-    return bool(
-        normalized
-        and ENGLISH_WORD_RE.fullmatch(normalized)
-        and normalized not in NON_WORD_FALLBACK_TERMS
-    )
+    # ここでは文字種だけを確認し、単語として存在するかはWiktionaryに任せる。
+    return bool(normalized and ENGLISH_WORD_RE.fullmatch(normalized))
 
 
-async def _has_cached_wiktionary_english_entry(word: str) -> bool:
+async def has_cached_wiktionary_english_entry(word: str) -> bool:
     normalized = word.strip().lower()
     if normalized in _wiktionary_entry_cache:
         return _wiktionary_entry_cache[normalized]
@@ -339,8 +348,8 @@ async def ensure_meanings_for_word(
         generate_japanese
         and allow_fallback_generation
         and part_of_speech
-        and _is_safe_gemini_fallback_term(word)
-        and await _has_cached_wiktionary_english_entry(word)
+        and _has_english_term_shape(word)
+        and await has_cached_wiktionary_english_entry(word)
         and not _existing_meaning_rows(word_id, part_of_speech)
     ):
         definition_ja = await generate_fallback_japanese_definition(word, part_of_speech)
@@ -405,7 +414,10 @@ async def ensure_japanese_definitions_for_word(
     return updated
 
 
-async def batch_generate_missing_japanese_definitions(items: list[dict], chunk_size: int = 40) -> int:
+async def batch_generate_missing_japanese_definitions(
+    items: list[dict],
+    chunk_size: int | None = None,
+) -> int:
     """
     教材内の語義について、definition_ja が空の既存 meaning と
     Wiktionary で該当品詞が取れなかった単語品詞をまとめて Gemini 生成する。
@@ -418,9 +430,7 @@ async def batch_generate_missing_japanese_definitions(items: list[dict], chunk_s
     for item in items:
         word = (item.get("text") or "").strip().lower()
         part_of_speech = normalize_part_of_speech(item.get("part_of_speech"))
-        if not word or not part_of_speech or not _is_safe_gemini_fallback_term(word):
-            continue
-        if not await _has_cached_wiktionary_english_entry(word):
+        if not word or not part_of_speech or not _has_english_term_shape(word):
             continue
         key = (word, part_of_speech)
         if key in seen:
@@ -431,16 +441,29 @@ async def batch_generate_missing_japanese_definitions(items: list[dict], chunk_s
         if not word_rows:
             continue
         word_id = word_rows[0]["id"]
-        meaning_rows = (
+        all_meaning_rows = (
             db.table("meanings")
             .select("id, part_of_speech, definition_en, definition_ja, transitivity, countability")
             .eq("word_id", word_id)
-            .eq("part_of_speech", part_of_speech)
             .execute()
             .data
             or []
         )
+        meaning_rows = [
+            row
+            for row in all_meaning_rows
+            if _meaning_pos_matches(
+                part_of_speech,
+                normalize_part_of_speech(row.get("part_of_speech")) or "",
+            )
+        ]
         if not meaning_rows:
+            # DBに互換品詞のmeaningがない場合に限りWiktionaryで英語見出し語を
+            # 確認する。DBにある語を外部判定の失敗で落とさない。
+            if not await has_cached_wiktionary_english_entry(word):
+                continue
+            # 同じ品詞の保存済み定義がなければ、termと品詞から直接生成する。
+            # 生成に失敗したものだけを「訳なし」として残す。
             request_id = f"fallback:{word_id}:{part_of_speech}"
             requests.append({
                 "id": request_id,
@@ -469,9 +492,14 @@ async def batch_generate_missing_japanese_definitions(items: list[dict], chunk_s
             })
 
     updated = 0
-    for start in range(0, len(requests), chunk_size):
-        chunk = requests[start:start + chunk_size]
+    failed_count = 0
+    # 初回生成は不足分をすべて1回で送る。欠落したIDだけを内部で再試行する。
+    effective_chunk_size = chunk_size or max(1, len(requests))
+    for start in range(0, len(requests), effective_chunk_size):
+        chunk = requests[start:start + effective_chunk_size]
         generated = await generate_japanese_definitions_batch(chunk)
+        requested_ids = {str(request["id"]) for request in chunk}
+        failed_count += len(requested_ids - set(generated))
         for request_id, definition_ja in generated.items():
             if request_id.startswith("meaning:"):
                 meaning_id = int(request_id.split(":", 1)[1])
@@ -491,6 +519,10 @@ async def batch_generate_missing_japanese_definitions(items: list[dict], chunk_s
                 "tier": None,
             }).execute()
             updated += 1
+    if failed_count:
+        # 生成済み分は保存したうえで、画面へ部分失敗を明示する。黙って成功扱いに
+        # すると不足語が「訳なし」に残った理由を利用者が判断できない。
+        raise RuntimeError(f"Gemini failed to generate {failed_count} meaning(s).")
     return updated
 
 

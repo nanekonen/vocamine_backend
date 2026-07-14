@@ -141,6 +141,8 @@ CREATE TABLE IF NOT EXISTS materials (
     source_object_storage_key       TEXT,
     page_images_object_storage_keys JSONB NOT NULL DEFAULT '[]'::jsonb,
     source_word_boxes   JSONB NOT NULL DEFAULT '[]'::jsonb,
+    analysis_summary    JSONB,
+    analysis_items      JSONB,
     created_at          TIMESTAMPTZ DEFAULT now()
 );
 

@@ -22,6 +22,9 @@ WORD_RE = re.compile(r"[A-Za-z]+(?:['’-][A-Za-z]+)*")
 AZURE_API_VERSION = "2024-11-30"
 AZURE_FREE_MAX_BYTES = 4 * 1024 * 1024
 AZURE_FREE_MAX_PAGES = 2
+AZURE_MAX_REQUEST_RETRIES = 5
+AZURE_MIN_POLL_SECONDS = 2.0
+_AZURE_ANALYSIS_LOCK = asyncio.Lock()
 
 
 # def _get_vision_client() -> vision.ImageAnnotatorClient:
@@ -573,7 +576,9 @@ async def _analyze_azure_pdf(payload: bytes) -> dict:
     url = f"{endpoint}/documentintelligence/documentModels/prebuilt-read:analyze"
     auth = {"Ocp-Apim-Subscription-Key": key}
     async with httpx.AsyncClient(timeout=60) as client:
-        response = await client.post(
+        response = await _azure_request_with_retry(
+            client,
+            "POST",
             url,
             params={"api-version": AZURE_API_VERSION},
             headers={**auth, "Content-Type": "application/pdf"},
@@ -584,34 +589,102 @@ async def _analyze_azure_pdf(payload: bytes) -> dict:
         if not operation_url:
             raise ValueError("Azure did not return operation-location.")
         for _ in range(120):
-            await asyncio.sleep(1.0)  # F0: one GET operation per second.
-            result_response = await client.get(operation_url, headers=auth)
+            await asyncio.sleep(_azure_retry_delay(response, minimum=AZURE_MIN_POLL_SECONDS))
+            result_response = await _azure_request_with_retry(
+                client,
+                "GET",
+                operation_url,
+                headers=auth,
+            )
             result_response.raise_for_status()
             result = result_response.json()
             if result.get("status") == "succeeded":
                 return result.get("analyzeResult") or {}
             if result.get("status") in {"failed", "canceled"}:
                 raise ValueError(f"Azure analysis failed: {result.get('error')}")
+            response = result_response
     raise TimeoutError("Azure Document Intelligence analysis timed out.")
+
+
+def _azure_retry_delay(response: httpx.Response, minimum: float = 1.0) -> float:
+    value = response.headers.get("retry-after")
+    try:
+        return max(minimum, float(value)) if value is not None else minimum
+    except ValueError:
+        return minimum
+
+
+async def _azure_request_with_retry(
+    client: httpx.AsyncClient,
+    method: str,
+    url: str,
+    **kwargs,
+) -> httpx.Response:
+    """Honor Azure throttling instead of treating a temporary 429 as quota exhaustion."""
+    response: httpx.Response | None = None
+    for attempt in range(AZURE_MAX_REQUEST_RETRIES + 1):
+        response = await client.request(method, url, **kwargs)
+        retryable = response.status_code == 429 or response.status_code >= 500
+        if not retryable or attempt == AZURE_MAX_REQUEST_RETRIES:
+            return response
+        delay = max(
+            _azure_retry_delay(response),
+            min(16.0, float(2 ** attempt)),
+        )
+        print(
+            f"[ocr] Azure {method} returned {response.status_code}; "
+            f"retrying in {delay:g}s ({attempt + 1}/{AZURE_MAX_REQUEST_RETRIES})."
+        )
+        await asyncio.sleep(delay)
+    assert response is not None
+    return response
 
 
 async def extract_text_and_boxes_with_azure(
     page_images: list[bytes],
 ) -> tuple[str, list[dict]]:
+    # F0はAnalyze/Getとも1 TPS。別のアップロードとポーリングが競合しないよう、
+    # 1プロセス内のAzure処理を直列化する。
+    async with _AZURE_ANALYSIS_LOCK:
+        return await _extract_text_and_boxes_with_azure_locked(page_images)
+
+
+async def _extract_text_and_boxes_with_azure_locked(
+    page_images: list[bytes],
+) -> tuple[str, list[dict]]:
     texts: list[str] = []
     boxes: list[dict] = []
     for batch_start, payload in _page_images_to_azure_batches(page_images):
-        result = await _analyze_azure_pdf(payload)
-        content = str(result.get("content") or "").strip()
-        if content:
-            texts.append(content)
-        for local_index, page in enumerate(result.get("pages") or []):
-            page_number = int(page.get("pageNumber") or local_index + 1)
-            page_index = batch_start + page_number - 1
-            for word in page.get("words") or []:
-                box = _azure_word_box(word, page, page_index)
-                if box and box["text"]:
-                    boxes.append(box)
-        await asyncio.sleep(1.0)  # F0: one analyze transaction per second.
+        try:
+            result = await _analyze_azure_pdf(payload)
+            content = str(result.get("content") or "").strip()
+            if content:
+                texts.append(content)
+            for local_index, page in enumerate(result.get("pages") or []):
+                page_number = int(page.get("pageNumber") or local_index + 1)
+                page_index = batch_start + page_number - 1
+                for word in page.get("words") or []:
+                    box = _azure_word_box(word, page, page_index)
+                    if box and box["text"]:
+                        boxes.append(box)
+            print(
+                f"[ocr] Azure processed pages {batch_start + 1}-"
+                f"{min(batch_start + AZURE_FREE_MAX_PAGES, len(page_images))}."
+            )
+        except Exception as exc:
+            # 途中の1バッチだけが失敗しても、既に成功したAzure結果を捨てない。
+            sources = page_images[batch_start:batch_start + AZURE_FREE_MAX_PAGES]
+            fallback_boxes = _tesseract_boxes_from_page_images(sources)
+            for box in fallback_boxes:
+                box["page_index"] = batch_start + int(box.get("page_index") or 0)
+            fallback_text = text_from_word_boxes(fallback_boxes)
+            if fallback_text:
+                texts.append(fallback_text)
+            boxes.extend(fallback_boxes)
+            print(
+                f"[ocr] Azure failed for pages {batch_start + 1}-"
+                f"{min(batch_start + AZURE_FREE_MAX_PAGES, len(page_images))}; "
+                f"using Tesseract for this batch only: {exc!r}"
+            )
     text = "\n\n".join(texts).strip()
     return text, attach_word_box_offsets(boxes, text)

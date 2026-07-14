@@ -1,6 +1,7 @@
 from __future__ import annotations
 import asyncio
 import csv
+import os
 import re
 from functools import lru_cache
 from pathlib import Path
@@ -16,6 +17,7 @@ from app.services.word_lookup_service import (
     batch_generate_missing_japanese_definitions,
     ensure_meanings_for_word,
     get_or_create_word,
+    has_cached_wiktionary_english_entry,
     record_wordbook_registration,
 )
 
@@ -49,15 +51,6 @@ PHRASE_LIST_DIR = Path(__file__).resolve().parents[2] / "phrase_list"
 ACL_FILENAME = "The_Academic_Collocation_List(Academic Collocation List).csv"
 TRAILING_POS_RE = re.compile(r"\s*\((?:adj|adv|n|v|vpp)\)\s*$", re.IGNORECASE)
 ENGLISH_WORD_RE = re.compile(r"^[a-z]+(?:['’-][a-z]+)*$", re.IGNORECASE)
-NON_WORD_TEXTS = {
-    "http",
-    "https",
-    "www",
-    "com",
-    "org",
-    "net",
-    "pdf",
-}
 ARTICLE_WORDS = {"a", "an", "the"}
 DEMONSTRATIVE_WORDS = {"this", "that", "these", "those"}
 POSSESSIVE_DETERMINER_WORDS = {
@@ -91,14 +84,20 @@ QUANTIFIER_WORDS = {
     "several",
     "some",
 }
+_LEXICAL_ENRICHMENT_LOCK = asyncio.Lock()
 
 
 @lru_cache(maxsize=1)
 def _get_spacy_nlp():
+    model_name = os.getenv("SPACY_MODEL", "en_core_web_trf")
     try:
-        return spacy.load("en_core_web_sm")
-    except Exception:
-        return spacy.blank("en")
+        # 固有表現抽出は使用しない。品詞、係り受け、原形の処理だけを読み込む。
+        return spacy.load(model_name, disable=["ner"])
+    except Exception as exc:
+        raise RuntimeError(
+            f"spaCy model '{model_name}' could not be loaded. "
+            "Install the configured model or set SPACY_MODEL to an installed model."
+        ) from exc
 
 
 def _normalize_phrase_text(value: str) -> str:
@@ -184,25 +183,15 @@ def _is_english_phrase_text(value: str) -> bool:
     return len(words) > 1 and all(_is_english_word_text(word) for word in words)
 
 
-def _is_valid_single_letter_word_token(token) -> bool:
-    text = token.text
-    if len(text) != 1:
-        return True
-    if text.lower() == "a":
-        return token.pos_ == "DET" or token.tag_ == "DT"
-    if text == "I":
-        return token.pos_ == "PRON" or token.tag_ == "PRP"
-    return False
-
-
 def _is_valid_word_token(token) -> bool:
-    if not token.is_alpha or not token.is_ascii:
+    is_contracted_auxiliary = (
+        token.pos_ == "AUX"
+        and token.text.startswith(("'", "’"))
+        and _is_english_word_text(_normalize_lemma(token))
+    )
+    if (not token.is_alpha or not token.is_ascii) and not is_contracted_auxiliary:
         return False
-    if token.text.lower() in NON_WORD_TEXTS:
-        return False
-    if not _is_valid_single_letter_word_token(token):
-        return False
-    return _is_english_word_text(token.text)
+    return is_contracted_auxiliary or _is_english_word_text(token.text)
 
 
 def _determiner_detail(token) -> Optional[str]:
@@ -210,13 +199,19 @@ def _determiner_detail(token) -> Optional[str]:
     tag = token.tag_
     if tag == "CD" or token.pos_ == "NUM":
         return "numeral"
-    if text in ARTICLE_WORDS:
+    if text in ARTICLE_WORDS and (token.pos_ == "DET" or tag == "DT"):
         return "article"
-    if text in DEMONSTRATIVE_WORDS:
+    if (
+        text in DEMONSTRATIVE_WORDS
+        and (token.pos_ in {"DET", "PRON"} or tag in {"DT", "PDT", "WDT"})
+    ):
         return "demonstrative"
-    if text in POSSESSIVE_DETERMINER_WORDS or tag == "PRP$":
+    if tag == "PRP$":
         return "possessive_determiner"
-    if text in QUANTIFIER_WORDS:
+    if (
+        text in QUANTIFIER_WORDS
+        and (token.pos_ == "DET" or tag in {"DT", "PDT", "WDT"})
+    ):
         return "quantifier"
     return None
 
@@ -384,7 +379,9 @@ def _phrase_catalog() -> list[str]:
 
 def analyze_lexical_items(text: str) -> list[dict]:
     nlp = _get_spacy_nlp()
-    doc = nlp(text)
+    # spaCyの英語モデルは曲線アポストロフィの短縮形を安定して原形化しないため、
+    # 文字数を変えずにASCIIアポストロフィへ揃えてから解析する。
+    doc = nlp(text.replace("’", "'"))
     if not doc:
         return []
 
@@ -421,8 +418,14 @@ def analyze_lexical_items(text: str) -> list[dict]:
     for token in remaining_tokens:
         lemma = _normalize_lemma(token)
         pos, pos_detail = _map_spacy_pos(token)
-        if not lemma or not pos or not _is_english_word_text(lemma):
+        if not lemma or not _is_english_word_text(lemma):
             continue
+        if not pos:
+            # spaCyが英字トークンをPUNCT等にした場合もここでは捨てない。
+            # 実在判定は後段のWiktionaryへ任せ、該当品詞が取れなければ
+            # Gemini生成へ進められる汎用カテゴリとして保持する。
+            pos = PartOfSpeech.abbreviation.value
+            pos_detail = None
         candidate_items.append({
             "text": lemma,
             "part_of_speech": pos,
@@ -441,6 +444,47 @@ def analyze_lexical_items(text: str) -> list[dict]:
         items.append(item)
 
     return _dedupe_items(items)
+
+
+async def _filter_to_wiktionary_entries(items: list[dict]) -> list[dict]:
+    """DBにないspaCy候補だけをWiktionaryで英語見出し語か確認する。"""
+    stored_keys = await asyncio.to_thread(_meaning_keys_in_database, items)
+    terms = sorted({
+        str(item.get("text") or "").strip().lower()
+        for item in items
+        if item.get("kind") != "phrase"
+        and item.get("text")
+        and (
+            str(item.get("text") or "").strip().lower().replace("’", "'"),
+            str(item.get("part_of_speech") or "").strip().lower(),
+        ) not in stored_keys
+    })
+    if not terms:
+        return items
+
+    semaphore = asyncio.Semaphore(4)
+
+    async def validate(term: str) -> tuple[str, bool]:
+        async with semaphore:
+            try:
+                return term, await has_cached_wiktionary_english_entry(term)
+            except Exception as exc:
+                print(f"[wiktionary-validation] failed for {term!r}: {exc!r}")
+                # API制限や通信障害は「English entryなし」ではない。
+                # 一時失敗で教材から語を消さず、後続の再取得に残す。
+                return term, True
+
+    validity = dict(await asyncio.gather(*(validate(term) for term in terms)))
+    return [
+        item
+        for item in items
+        if item.get("kind") == "phrase"
+        or (
+            str(item.get("text") or "").strip().lower().replace("’", "'"),
+            str(item.get("part_of_speech") or "").strip().lower(),
+        ) in stored_keys
+        or validity.get(str(item.get("text") or "").strip().lower(), False)
+    ]
 
 POS_SUPERTYPES = {
     PartOfSpeech.article.value: {
@@ -495,8 +539,86 @@ def pos_matches(material_pos: str, learned_pos: str) -> bool:
     return learned_pos in POS_SUPERTYPES.get(material_pos, {material_pos})
 
 
-def _meaning_keys_with_japanese(items: list[dict]) -> set[tuple[str, str]]:
-    """保存済み日本語訳の有無を単語ごとのN+1ではなく一括取得する。"""
+MEANING_POS_COMPATIBILITY: dict[str, set[str]] = {
+    PartOfSpeech.noun.value: {
+        PartOfSpeech.noun.value,
+        PartOfSpeech.pronoun.value,
+        PartOfSpeech.abbreviation.value,
+    },
+    PartOfSpeech.pronoun.value: {
+        PartOfSpeech.pronoun.value,
+        PartOfSpeech.noun.value,
+        PartOfSpeech.determiner.value,
+    },
+    PartOfSpeech.verb.value: {
+        PartOfSpeech.verb.value,
+        PartOfSpeech.auxiliary.value,
+    },
+    PartOfSpeech.auxiliary.value: {
+        PartOfSpeech.auxiliary.value,
+        PartOfSpeech.verb.value,
+    },
+    PartOfSpeech.article.value: {
+        PartOfSpeech.article.value,
+        PartOfSpeech.determiner.value,
+    },
+    PartOfSpeech.determiner.value: {
+        PartOfSpeech.determiner.value,
+        PartOfSpeech.article.value,
+        PartOfSpeech.pronoun.value,
+        PartOfSpeech.adjective.value,
+        PartOfSpeech.numeral.value,
+    },
+    PartOfSpeech.adjective.value: {
+        PartOfSpeech.adjective.value,
+        PartOfSpeech.determiner.value,
+    },
+    PartOfSpeech.numeral.value: {
+        PartOfSpeech.numeral.value,
+        PartOfSpeech.determiner.value,
+    },
+    PartOfSpeech.abbreviation.value: {
+        PartOfSpeech.abbreviation.value,
+        PartOfSpeech.noun.value,
+    },
+}
+
+
+def meaning_pos_matches(detected_pos: str, meaning_pos: str) -> bool:
+    """spaCyが混同し得る品詞だけを表示用meaningとして互換扱いする。"""
+    return meaning_pos in MEANING_POS_COMPATIBILITY.get(
+        detected_pos,
+        {detected_pos},
+    )
+
+
+def _has_compatible_japanese_meaning(word_id: int, detected_pos: str) -> bool:
+    rows = (
+        get_supabase()
+        .table("meanings")
+        .select("part_of_speech")
+        .eq("word_id", word_id)
+        .filter("definition_ja", "not.is", "null")
+        .neq("definition_ja", "")
+        .execute()
+        .data
+        or []
+    )
+    return any(
+        meaning_pos_matches(
+            detected_pos,
+            str(row.get("part_of_speech") or "").strip().lower(),
+        )
+        for row in rows
+    )
+
+
+def _meaning_keys_in_database(
+    items: list[dict],
+    *,
+    require_japanese: bool = False,
+) -> set[tuple[str, str]]:
+    """DBに互換品詞のmeaningがある単語・検出品詞を一括取得する。"""
     db = get_supabase()
     words = sorted({
         item["text"].strip().lower().replace("’", "'")
@@ -520,25 +642,55 @@ def _meaning_keys_with_japanese(items: list[dict]) -> set[tuple[str, str]]:
         for row in rows:
             word_ids[int(row["id"])] = str(row.get("word") or "").strip().lower()
 
-    result: set[tuple[str, str]] = set()
+    meaning_positions_by_word: dict[str, set[str]] = {}
     ids = list(word_ids)
     for start in range(0, len(ids), chunk_size):
-        rows = (
+        query = (
             db.table("meanings")
             .select("word_id, part_of_speech")
             .in_("word_id", ids[start:start + chunk_size])
-            .filter("definition_ja", "not.is", "null")
-            .neq("definition_ja", "")
-            .execute()
-            .data
-            or []
         )
+        if require_japanese:
+            query = (
+                query.filter("definition_ja", "not.is", "null")
+                .neq("definition_ja", "")
+            )
+        rows = query.execute().data or []
         for row in rows:
             word = word_ids.get(int(row["word_id"]))
-            pos = str(row.get("part_of_speech") or "")
-            if word and pos:
-                result.add((word, pos))
-    return result
+            if word:
+                meaning_positions_by_word.setdefault(word, set()).add(
+                    str(row.get("part_of_speech") or "").strip().lower()
+                )
+
+    return {
+        (
+            item["text"].strip().lower().replace("’", "'"),
+            str(item.get("part_of_speech") or "").strip().lower(),
+        )
+        for item in items
+        if item.get("text")
+        and item.get("part_of_speech")
+        and any(
+            meaning_pos_matches(
+                str(item.get("part_of_speech") or "").strip().lower(),
+                meaning_pos,
+            )
+            for meaning_pos in meaning_positions_by_word.get(
+                item["text"].strip().lower().replace("’", "'"),
+                set(),
+            )
+        )
+    }
+
+
+def _meaning_keys_with_japanese(items: list[dict]) -> set[tuple[str, str]]:
+    """保存済み日本語訳の有無を単語ごとのN+1ではなく一括取得する。
+
+    spaCyの品詞が辞書側の細分類とずれる場合があるため、互換品詞に限り
+    表示用訳として利用する。明らかに異なる品詞は訳あり扱いにしない。
+    """
+    return _meaning_keys_in_database(items, require_japanese=True)
 
 
 async def extract_unknown_words(text: str, user_id: str, enrich_meanings: bool = True) -> dict:
@@ -547,6 +699,7 @@ async def extract_unknown_words(text: str, user_id: str, enrich_meanings: bool =
     判定: wordbook_words に is_learned=true のエントリーがない単語 = 未知
     """
     lexical_items = await asyncio.to_thread(analyze_lexical_items, text)
+    lexical_items = await _filter_to_wiktionary_entries(lexical_items)
     if not lexical_items:
         return {
             "unknown_words": [],
@@ -585,7 +738,15 @@ async def extract_unknown_words(text: str, user_id: str, enrich_meanings: bool =
                 part_of_speech=item["part_of_speech"],
                 enrich_meanings=not is_learned,
             )
-            has_meaning = lookup["meaning_count"] > 0
+            # 検出品詞の生成を試したうえで、spaCyが混同し得る互換品詞だけを
+            # フォールバックにする。明らかに別品詞しかなければ訳なし。
+            has_meaning = (
+                lookup["meaning_count"] > 0
+                or _has_compatible_japanese_meaning(
+                    lookup["word_id"],
+                    material_pos,
+                )
+            )
         else:
             has_meaning = (word, material_pos) in stored_meaning_keys
 
@@ -616,12 +777,34 @@ async def extract_unknown_words(text: str, user_id: str, enrich_meanings: bool =
 
 
 async def enrich_lexical_items(items: list[dict]) -> None:
+    async with _LEXICAL_ENRICHMENT_LOCK:
+        await _enrich_lexical_items_locked(items)
+
+
+async def _enrich_lexical_items_locked(items: list[dict]) -> None:
     """
     教材中に出てきた語・熟語について、同一単語・同一品詞の meaning がなければ補完する。
     画面表示やカバー率計算を待たせないため、API からは BackgroundTasks で呼び出す。
     """
+    stored_keys = _meaning_keys_with_japanese(items)
+    target_items = [
+        item
+        for item in items
+        if (
+            (item.get("text") or "").strip().lower().replace("’", "'"),
+            str(item.get("part_of_speech") or "").strip().lower(),
+        ) not in stored_keys
+    ]
+    if not target_items:
+        return
+
+    print(
+        f"[background-enrichment] processing {len(target_items)}/"
+        f"{len(items)} untranslated lexical items."
+    )
     seen: set[tuple[str, str]] = set()
-    for item in items:
+    unique_targets: list[dict] = []
+    for item in target_items:
         text = (item.get("text") or "").strip().lower()
         part_of_speech = item.get("part_of_speech")
         if not text or not part_of_speech:
@@ -630,28 +813,37 @@ async def enrich_lexical_items(items: list[dict]) -> None:
         if key in seen:
             continue
         seen.add(key)
-        try:
-            lookup = await get_or_create_word(
-                text,
-                part_of_speech=part_of_speech,
-                enrich_meanings=False,
-            )
-            await ensure_meanings_for_word(
-                lookup["word_id"],
-                text,
-                part_of_speech=part_of_speech,
-                generate_japanese=False,
-                allow_fallback_generation=False,
-            )
-        except Exception:
-            continue
-    await batch_generate_missing_japanese_definitions(items)
+        unique_targets.append(item)
+
+    semaphore = asyncio.Semaphore(8)
+
+    async def enrich_item(item: dict) -> None:
+        text = (item.get("text") or "").strip().lower()
+        part_of_speech = item.get("part_of_speech")
+        async with semaphore:
+            try:
+                await get_or_create_word(
+                    text,
+                    part_of_speech=part_of_speech,
+                    enrich_meanings=False,
+                )
+            except Exception as exc:
+                print(
+                    "[background-enrichment] "
+                    f"failed for {text!r} ({part_of_speech}): {exc!r}"
+                )
+
+    await asyncio.gather(*(enrich_item(item) for item in unique_targets))
+    updated = await batch_generate_missing_japanese_definitions(unique_targets)
+    print(
+        f"[background-enrichment] completed; generated {updated} Japanese meanings."
+    )
 
 
-def enrich_lexical_items_background(items: list[dict]) -> None:
-    """FastAPIのthread poolで意味補完を動かし、API全体を停止させない。"""
+async def enrich_lexical_items_background(items: list[dict]) -> None:
+    """レスポンス送信後も同じイベントループで意味補完を継続する。"""
     try:
-        asyncio.run(enrich_lexical_items(items))
+        await enrich_lexical_items(items)
     except Exception as exc:
         # レスポンス送信後の補完失敗をASGIリクエスト例外にしない。
         print(f"[background-enrichment] failed: {exc!r}")

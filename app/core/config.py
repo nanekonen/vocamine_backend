@@ -10,7 +10,8 @@ class Settings(BaseSettings):
     azure_document_intelligence_endpoint: str = ""
     azure_document_intelligence_key: str = ""
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-2.5-flash"
+    gemini_api_key2: str = ""
+    gemini_model: str = "gemini-flash-latest"
     wiktionary_user_agent: str = "Glossalyze/0.1 (local development; contact unset)"
     app_env: str = "development"
     # Piper settings are disabled while server-side pronunciation is unused.

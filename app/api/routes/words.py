@@ -12,6 +12,7 @@ from app.schemas.schemas import (
     BatchWordsRequest, BatchWordsResponse, BatchWordResult,
 )
 from app.services.word_service import (
+    enrich_lexical_items,
     enrich_lexical_items_background,
     extract_unknown_words,
 )
@@ -24,6 +25,7 @@ from app.services.word_lookup_service import (
 )
 from app.services.dictionary_service import normalize_part_of_speech
 from app.services.user_identity_service import resolve_user_id
+from app.services.material_analysis_service import refresh_user_material_analyses
 # from app.services.pronunciation_service import get_pronunciation_audio  # Piper disabled
 
 router = APIRouter(prefix="/words", tags=["Words"])
@@ -78,7 +80,16 @@ async def lookup_word(
 
 @router.post("/stored-meanings", response_model=list[WordResponse])
 async def get_stored_meanings(payload: StoredMeaningsRequest):
-    """教材画面向けに、DB保存済みの意味だけを一括取得する。外部辞書は呼ばない。"""
+    """教材画面向けに意味を一括取得し、初回は不足分の生成完了も待つ。"""
+    if payload.enrich_missing:
+        await enrich_lexical_items([
+            item.model_dump(mode="json")
+            for item in payload.items
+        ])
+        if payload.user_id:
+            await refresh_user_material_analyses(
+                resolve_user_id(payload.user_id)
+            )
     words = sorted({
         item.text.strip().lower().replace("’", "'")
         for item in payload.items
@@ -86,14 +97,21 @@ async def get_stored_meanings(payload: StoredMeaningsRequest):
     })
     if not words:
         return []
-    response = (
-        get_supabase()
-        .table("words")
-        .select("*, meanings(*, example_sentences(*))")
-        .in_("word", words)
-        .execute()
-    )
-    return response.data or []
+    # Supabase/PostgRESTは1リクエストの返却行数を既定で1000件に制限する。
+    # 大きい教材を一度に検索すると後半の語（such asなど）が欠落するため、
+    # 小分けに取得して全件を結合する。
+    db = get_supabase()
+    rows: list[dict] = []
+    chunk_size = 200
+    for start in range(0, len(words), chunk_size):
+        response = (
+            db.table("words")
+            .select("*, meanings(*, example_sentences(*))")
+            .in_("word", words[start:start + chunk_size])
+            .execute()
+        )
+        rows.extend(response.data or [])
+    return rows
 
 
 @router.post("/regenerate-missing-japanese")
@@ -148,7 +166,7 @@ async def get_word(word_id: int):
 # ── 未知単語の一括登録（OCR結果 → 単語帳へ） ─────────────────────────────────
 
 @router.post("/batch", response_model=BatchWordsResponse, status_code=201)
-async def add_words_batch(payload: BatchWordsRequest):
+async def add_words_batch(payload: BatchWordsRequest, background_tasks: BackgroundTasks):
     """
     未知単語のリストを受け取り、それぞれ:
       1. words テーブルに存在しなければ登録
@@ -223,6 +241,7 @@ async def add_words_batch(payload: BatchWordsRequest):
             meaning_count=lookup["meaning_count"],
         ))
 
+    background_tasks.add_task(refresh_user_material_analyses, user_id)
     return BatchWordsResponse(
         total=len(unique_items),
         registered_count=len(registered_wordbook_word_ids),
@@ -287,7 +306,11 @@ async def get_wordbook(
 
 
 @router.post("/wordbook", response_model=WordbookWordResponse, status_code=201)
-async def add_to_wordbook(user_id: str, payload: WordbookWordCreate):
+async def add_to_wordbook(
+    user_id: str,
+    payload: WordbookWordCreate,
+    background_tasks: BackgroundTasks,
+):
     """meaning_idを単語帳（未学習）に追加する"""
     user_id = resolve_user_id(user_id)
     validate_owned_wordbook(user_id, payload.wordbook_id)
@@ -339,6 +362,7 @@ async def add_to_wordbook(user_id: str, payload: WordbookWordCreate):
                 source_folder_id=payload.source_folder_id,
                 source_label=payload.source_label,
             )
+            background_tasks.add_task(refresh_user_material_analyses, user_id)
             return updated.data[0] if updated.data else existing.data[0]
         response = db.table("wordbook_words").insert({
             "user_id": user_id,
@@ -353,6 +377,7 @@ async def add_to_wordbook(user_id: str, payload: WordbookWordCreate):
             source_folder_id=payload.source_folder_id,
             source_label=payload.source_label,
         )
+        background_tasks.add_task(refresh_user_material_analyses, user_id)
         return response.data[0]
     except HTTPException:
         raise
@@ -361,7 +386,11 @@ async def add_to_wordbook(user_id: str, payload: WordbookWordCreate):
 
 
 @router.patch("/wordbook/{entry_id}", response_model=WordbookWordResponse)
-async def update_wordbook_entry(entry_id: int, payload: WordbookWordUpdate):
+async def update_wordbook_entry(
+    entry_id: int,
+    payload: WordbookWordUpdate,
+    background_tasks: BackgroundTasks,
+):
     """学習済み/未学習を切り替える"""
     db = get_supabase()
     response = (
@@ -372,14 +401,30 @@ async def update_wordbook_entry(entry_id: int, payload: WordbookWordUpdate):
     )
     if not response.data:
         raise HTTPException(status_code=404, detail="Entry not found.")
+    user_id = response.data[0].get("user_id")
+    if user_id:
+        background_tasks.add_task(refresh_user_material_analyses, str(user_id))
     return response.data[0]
 
 
 @router.delete("/wordbook/{entry_id}", status_code=204)
-async def delete_wordbook_entry(entry_id: int):
+async def delete_wordbook_entry(entry_id: int, background_tasks: BackgroundTasks):
     """単語帳からエントリーを削除する"""
     db = get_supabase()
+    current = (
+        db.table("wordbook_words")
+        .select("user_id")
+        .eq("id", entry_id)
+        .maybe_single()
+        .execute()
+        .data
+    )
     db.table("wordbook_words").delete().eq("id", entry_id).execute()
+    if current and current.get("user_id"):
+        background_tasks.add_task(
+            refresh_user_material_analyses,
+            str(current["user_id"]),
+        )
 
 
 # ── 未知単語抽出 ──────────────────────────────────────────────────────────────

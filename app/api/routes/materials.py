@@ -28,6 +28,10 @@ from app.services.ocr_service import (
     _png_dimensions,
 )
 from app.services.user_identity_service import resolve_user_id
+from app.services.material_analysis_service import (
+    refresh_material_analysis,
+    refresh_user_material_analyses,
+)
 
 router = APIRouter(prefix="/materials", tags=["Materials"])
 
@@ -110,6 +114,24 @@ def _load_material_assets(row: dict) -> dict:
     except Exception as exc:
         print(f"[materials] failed to load page_images for {material_id}: {exc!r}")
         page_images_raw = []
+
+    # 画像教材の旧データは原本だけ保存され、再表示用page_imagesがない。
+    # Object Storageの原本からプレビューを復元し、次回以降のために保存する。
+    source_mime_type = str(row.get("source_mime_type") or "")
+    source_key = row.get("source_object_storage_key")
+    if not page_images_raw and source_mime_type.startswith("image/") and source_key:
+        try:
+            encoded_source = base64.b64encode(get_bytes(source_key)).decode("ascii")
+            page_images_raw = [encoded_source]
+            put_bytes(
+                _json_key(user_id, material_id, "page_images"),
+                json.dumps(page_images_raw).encode("utf-8"),
+                "application/json",
+            )
+        except Exception as exc:
+            print(
+                f"[materials] failed to restore image preview for {material_id}: {exc!r}"
+            )
 
     try:
         layer_raw = json.loads(
@@ -227,17 +249,43 @@ async def list_materials(user_id: str = Query(...)):
         .data
         or []
     )
-    materials = (
-        db.table("materials")
-        .select("*")
-        .eq("user_id", user_id)
-        .order("created_at", desc=False)
-        .execute()
-        .data
-        or []
+    material_fields = (
+        "id, user_id, folder_id, default_wordbook_id, title, "
+        "extracted_text, source_mime_type, source_object_storage_key, "
+        "readable_pdf_object_storage_key, thumbnail_object_storage_key, "
+        "analysis_summary, created_at"
     )
+    try:
+        materials = (
+            db.table("materials")
+            .select(material_fields)
+            .eq("user_id", user_id)
+            .order("created_at", desc=False)
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        # analysis_summary追加前でも既存教材一覧は利用可能にする。
+        materials = (
+            db.table("materials")
+            .select("*")
+            .eq("user_id", user_id)
+            .order("created_at", desc=False)
+            .execute()
+            .data
+            or []
+        )
+        for material in materials:
+            material["analysis_summary"] = None
     materials = [_load_material_assets(dict(material)) for material in materials]
     return {"folders": folders, "materials": materials}
+
+
+@router.post("/refresh-analysis", status_code=204)
+async def refresh_material_analyses(user_id: str = Query(...)):
+    """既存教材の未作成・古い集計キャッシュを現在の学習状態で更新する。"""
+    await refresh_user_material_analyses(resolve_user_id(user_id))
 
 
 @router.post("/folders", response_model=MaterialFolderResponse, status_code=201)
@@ -412,6 +460,16 @@ async def create_material(payload: MaterialCreate):
     }
     response = get_supabase().table("materials").insert(row).execute()
     row = dict(response.data[0])
+    try:
+        row["analysis_summary"] = await refresh_material_analysis(
+            material_id,
+            user_id,
+            reparse_text=True,
+        )
+    except Exception as exc:
+        # マイグレーション適用前でも教材登録自体は失敗させない。
+        print(f"[material-analysis] initial refresh failed: {exc!r}")
+        row["analysis_summary"] = None
     # 保存直後にOracleを読み直さず、今アップロードしたデータをそのまま返す。
     # put_bytes 直後の get_bytes は read-after-write の一貫性に依存してしまうため、
     # 作成レスポンスでは使わない（一覧取得(list_materials)側は引き続き
@@ -531,6 +589,15 @@ async def append_material_pages(material_id: str, payload: MaterialPagesAppend):
     updated = db.table("materials").update({"extracted_text": combined_text}).eq(
         "id", material_id
     ).eq("user_id", user_id).execute().data[0]
+    try:
+        updated["analysis_summary"] = await refresh_material_analysis(
+            material_id,
+            user_id,
+            reparse_text=True,
+        )
+    except Exception as exc:
+        print(f"[material-analysis] appended-pages refresh failed: {exc!r}")
+        updated["analysis_summary"] = None
     return _load_material_assets(dict(updated))
 
 

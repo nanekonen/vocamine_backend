@@ -6,12 +6,117 @@ import io
 import re
 import httpx
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 from app.core.config import settings
 from app.schemas.schemas import CountabilityType, PartOfSpeech, TransitivityType
 
 WIKTIONARY_API = "https://en.wiktionary.org/w/api.php"
+JAPANESE_TEXT_RE = re.compile(r"[ぁ-んァ-ン一-龯]")
+_wiktionary_wikitext_cache: dict[str, Optional[str]] = {}
+
+
+class WiktionaryUnavailableError(RuntimeError):
+    pass
+
+_gemini_key_cooldowns: dict[str, float] = {}
+_gemini_key_cursor = 0
+
+
+def _configured_gemini_keys() -> list[str]:
+    """Return configured keys without exposing or using duplicates."""
+    keys: list[str] = []
+    for value in (settings.gemini_api_key, settings.gemini_api_key2):
+        key = value.strip()
+        if key and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def _available_gemini_keys() -> list[str]:
+    """Round-robin healthy keys so consecutive calls do not favor one project."""
+    global _gemini_key_cursor
+    now = time.monotonic()
+    keys = [
+        key
+        for key in _configured_gemini_keys()
+        if _gemini_key_cooldowns.get(key, 0.0) <= now
+    ]
+    if not keys:
+        return []
+    offset = _gemini_key_cursor % len(keys)
+    _gemini_key_cursor += 1
+    return keys[offset:] + keys[:offset]
+
+
+def _gemini_retry_delay(response: httpx.Response) -> float:
+    retry_header = response.headers.get("retry-after")
+    retry_match = re.search(
+        r"retry in ([0-9]+(?:\.[0-9]+)?)s",
+        response.text,
+        flags=re.IGNORECASE,
+    )
+    try:
+        seconds = float(retry_header or "")
+    except ValueError:
+        seconds = float(retry_match.group(1)) if retry_match else 60.0
+    return min(65.0, max(1.0, seconds + 0.5))
+
+
+def _mark_gemini_key_failure(api_key: str, status_code: int | None) -> None:
+    if status_code == 429:
+        # The precise retry delay is applied by the caller when available.
+        cooldown = 60.0
+    elif status_code in {400, 401, 403, 404}:
+        cooldown = 300.0
+    else:
+        cooldown = 15.0
+    _gemini_key_cooldowns[api_key] = time.monotonic() + cooldown
+
+
+def _mark_gemini_key_healthy(api_key: str) -> None:
+    _gemini_key_cooldowns.pop(api_key, None)
+
+
+async def _post_gemini_with_failover(
+    payload: dict,
+    *,
+    timeout: float,
+) -> Optional[httpx.Response]:
+    """Try healthy keys in rotation, immediately falling over to the other key."""
+    keys = _available_gemini_keys()
+    if not keys:
+        return None
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for key_index, api_key in enumerate(keys, start=1):
+            url = (
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{settings.gemini_model}:generateContent?key={api_key}"
+            )
+            try:
+                response = await client.post(url, json=payload)
+            except httpx.HTTPError as exc:
+                _mark_gemini_key_failure(api_key, None)
+                print(
+                    f"[gemini] key {key_index}/{len(keys)} request failed: "
+                    f"{type(exc).__name__}"
+                )
+                continue
+            if response.status_code == 200:
+                _mark_gemini_key_healthy(api_key)
+                return response
+            if response.status_code == 429:
+                _gemini_key_cooldowns[api_key] = (
+                    time.monotonic() + _gemini_retry_delay(response)
+                )
+            else:
+                _mark_gemini_key_failure(api_key, response.status_code)
+            print(
+                f"[gemini] key {key_index}/{len(keys)} unavailable "
+                f"(status={response.status_code}); trying another key."
+            )
+    return None
 
 POS_MAP = {
     "noun": PartOfSpeech.noun.value,
@@ -166,6 +271,8 @@ def _auxiliary_meanings_from_wikitext(term: str, wikitext: str) -> list[dict]:
 
 async def fetch_wiktionary_wikitext(term: str) -> Optional[str]:
     """Wiktionary の MediaWiki API からページ本文の wikitext を取得する。"""
+    if term in _wiktionary_wikitext_cache:
+        return _wiktionary_wikitext_cache[term]
     headers = {"User-Agent": settings.wiktionary_user_agent}
     params = {
         "action": "query",
@@ -176,24 +283,47 @@ async def fetch_wiktionary_wikitext(term: str) -> Optional[str]:
         "rvslots": "main",
         "titles": term,
     }
+    response: Optional[httpx.Response] = None
     async with httpx.AsyncClient(timeout=12.0, headers=headers) as client:
-        response = await client.get(WIKTIONARY_API, params=params)
+        for attempt in range(3):
+            try:
+                response = await client.get(WIKTIONARY_API, params=params)
+            except httpx.HTTPError as exc:
+                if attempt == 2:
+                    raise WiktionaryUnavailableError(
+                        f"Wiktionary request failed: {type(exc).__name__}"
+                    ) from exc
+                await asyncio.sleep(0.75 * (2 ** attempt))
+                continue
+            if response.status_code == 200:
+                break
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt < 2:
+                    await asyncio.sleep(0.75 * (2 ** attempt))
+                    continue
+            raise WiktionaryUnavailableError(
+                f"Wiktionary returned HTTP {response.status_code}."
+            )
 
-    if response.status_code != 200:
-        return None
+    if response is None or response.status_code != 200:
+        raise WiktionaryUnavailableError("Wiktionary did not return a response.")
 
     pages = response.json().get("query", {}).get("pages", [])
     if not pages or pages[0].get("missing"):
+        _wiktionary_wikitext_cache[term] = None
         return None
 
     revisions = pages[0].get("revisions") or []
     if not revisions:
+        _wiktionary_wikitext_cache[term] = None
         return None
 
     revision = revisions[0]
     slots = revision.get("slots") or {}
     main_slot = slots.get("main") or {}
-    return main_slot.get("content") or revision.get("content")
+    result = main_slot.get("content") or revision.get("content")
+    _wiktionary_wikitext_cache[term] = result
+    return result
 
 
 def _parse_wiktextract_page(term: str, wikitext: str) -> list[dict]:
@@ -445,14 +575,22 @@ async def fetch_wiktionary_meanings(term: str, part_of_speech: Optional[str] = N
 
 
 async def has_wiktionary_english_entry(term: str) -> bool:
-    wikitext = await fetch_wiktionary_wikitext(term)
-    if not wikitext:
-        return False
-    data = await asyncio.to_thread(_parse_wiktextract_page, term, wikitext)
-    for entry in data:
-        if entry.get("lang_code") == "en" and normalize_part_of_speech(entry.get("pos")):
+    # English entryの存在判定と、アプリがその品詞名を正規化できるかは別。
+    # character/symbol等の未対応品詞でもEnglish sectionがあれば英語項目として通す。
+    variants = [term]
+    upper = term.upper()
+    if upper != term:
+        variants.append(upper)
+    for variant in variants:
+        wikitext = await fetch_wiktionary_wikitext(variant)
+        if not wikitext:
+            continue
+        data = await asyncio.to_thread(_parse_wiktextract_page, variant, wikitext)
+        if any(entry.get("lang_code") == "en" for entry in data):
             return True
-    return bool(_auxiliary_meanings_from_wikitext(term, wikitext))
+        if _auxiliary_meanings_from_wikitext(variant, wikitext):
+            return True
+    return False
 
 
 def _compact_json(value: object) -> str:
@@ -472,11 +610,10 @@ def _build_generation_context(term: str, part_of_speech: str, source_item: dict)
     return _compact_json(payload)
 
 
-def _is_too_short_japanese_definition(text: str) -> bool:
+def _is_invalid_japanese_definition(text: str) -> bool:
     compact = text.strip().strip("「」『』\"'")
-    if not compact:
-        return True
-    return len(compact) <= 1
+    # 「空」「金」などの1文字で成立する訳を排除しない。
+    return not compact or not JAPANESE_TEXT_RE.search(compact)
 
 
 def _clean_generated_definition(text: str) -> str:
@@ -488,7 +625,7 @@ async def generate_japanese_definition(term: str, part_of_speech: str, source_it
     Gemini で英和辞典ふうの日本語語義を生成する。
     未設定または失敗時は None を返す。
     """
-    if not settings.gemini_api_key:
+    if not _configured_gemini_keys():
         return None
     context_json = _build_generation_context(term, part_of_speech, source_item)
     payload = {
@@ -499,7 +636,6 @@ async def generate_japanese_definition(term: str, part_of_speech: str, source_it
                         "あなたは英和辞典の編集者です。"
                         "英語の見出し語や説明文を繰り返さず、日本語の語義だけを返してください。"
                         "出力は日本語のみで、Markdown や箇条書き、引用符、注釈は不要です。"
-                        "漢字1文字だけの要約は禁止です。必ず辞書形の語または短い句にしてください。"
                         "動詞なら『走る』『運営する』のように活用語尾まで含めてください。"
                         "1つに絞らなくてよく、必要なら『走る、速く進む、疾走する』のように、"
                         "短い語義をベタ書きで並べてください。"
@@ -522,8 +658,6 @@ async def generate_japanese_definition(term: str, part_of_speech: str, source_it
                             "この情報をすべて参考にして日本語の語義を返してください。"
                             "必要なら複数の短い語義を1行でベタ書きしてかまいません。"
                             "ただし例文や解説は含めず、同じ意味の重複だけを自然にまとめてください。\n"
-                            "悪い例: 走\n"
-                            "良い例: 走る、速く進む\n"
                             f"{context_json}"
                         ),
                     }
@@ -538,14 +672,8 @@ async def generate_japanese_definition(term: str, part_of_speech: str, source_it
             },
         },
     }
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{settings.gemini_model}:generateContent?key={settings.gemini_api_key}"
-    )
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.post(url, json=payload)
-
-    if response.status_code != 200:
+    response = await _post_gemini_with_failover(payload, timeout=20.0)
+    if response is None:
         return None
 
     data = response.json()
@@ -560,7 +688,7 @@ async def generate_japanese_definition(term: str, part_of_speech: str, source_it
         if isinstance(part, dict) and not part.get("thought")
     ]
     text = _clean_generated_definition("".join(texts))
-    if _is_too_short_japanese_definition(text):
+    if _is_invalid_japanese_definition(text):
         return None
     return text
 
@@ -569,7 +697,7 @@ async def generate_fallback_japanese_definition(term: str, part_of_speech: str) 
     """
     Wiktionary で該当品詞の語義が取れない場合に、見出し語と品詞だけから日本語語義を生成する。
     """
-    if not settings.gemini_api_key:
+    if not _configured_gemini_keys():
         return None
     payload = {
         "systemInstruction": {
@@ -579,7 +707,6 @@ async def generate_fallback_japanese_definition(term: str, part_of_speech: str) 
                         "あなたは英和辞典の編集者です。"
                         "与えられた英語の見出し語と品詞に対応する、日本語の語義だけを返してください。"
                         "出力は日本語のみで、Markdown、箇条書き、引用符、注釈、例文は不要です。"
-                        "漢字1文字だけは禁止です。必ず辞書形の語または短い句にしてください。"
                         "その品詞として一般的に使われる意味に限定し、別品詞の意味を混ぜないでください。"
                     ),
                 }
@@ -608,14 +735,8 @@ async def generate_fallback_japanese_definition(term: str, part_of_speech: str) 
             },
         },
     }
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{settings.gemini_model}:generateContent?key={settings.gemini_api_key}"
-    )
-    async with httpx.AsyncClient(timeout=20.0) as client:
-        response = await client.post(url, json=payload)
-
-    if response.status_code != 200:
+    response = await _post_gemini_with_failover(payload, timeout=20.0)
+    if response is None:
         return None
 
     data = response.json()
@@ -630,17 +751,20 @@ async def generate_fallback_japanese_definition(term: str, part_of_speech: str) 
         if isinstance(part, dict) and not part.get("thought")
     ]
     text = _clean_generated_definition("".join(texts))
-    if _is_too_short_japanese_definition(text):
+    if _is_invalid_japanese_definition(text):
         return None
     return text
 
 
-async def generate_japanese_definitions_batch(requests: list[dict]) -> dict[str, str]:
+async def _generate_japanese_definitions_batch_once(
+    requests: list[dict],
+    api_key: str,
+) -> dict[str, str]:
     """
     複数の語義を1回の Gemini 呼び出しで日本語化する。
     requests: [{"id": str, "term": str, "part_of_speech": str, "definition_en": str | None, ...}]
     """
-    if not settings.gemini_api_key or not requests:
+    if not api_key or not requests:
         return {}
 
     compact_requests = [
@@ -669,7 +793,6 @@ async def generate_japanese_definitions_batch(requests: list[dict]) -> dict[str,
                         "別品詞の意味を混ぜないでください。"
                         "出力は JSON オブジェクトのみで、キーは入力の id、値は日本語語義文字列にしてください。"
                         "Markdown、箇条書き、注釈、例文は不要です。"
-                        "漢字1文字だけは禁止です。"
                     ),
                 }
             ]
@@ -686,7 +809,9 @@ async def generate_japanese_definitions_batch(requests: list[dict]) -> dict[str,
         ],
         "generationConfig": {
             "temperature": 0.2,
-            "maxOutputTokens": 4096,
+            # gemini-2.5-flash の出力上限まで許可する。教材内の不足語義は
+            # 初回にすべてまとめて送り、JSONが途中で切れる余地を減らす。
+            "maxOutputTokens": 65536,
             "responseMimeType": "application/json",
             "thinkingConfig": {
                 "thinkingBudget": 0,
@@ -695,26 +820,46 @@ async def generate_japanese_definitions_batch(requests: list[dict]) -> dict[str,
     }
     url = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{settings.gemini_model}:generateContent?key={settings.gemini_api_key}"
+        f"{settings.gemini_model}:generateContent?key={api_key}"
     )
-    async with httpx.AsyncClient(timeout=45.0) as client:
+    # 教材内の不足分を1回にまとめるため、通常の単語単体APIより長く待つ。
+    # 45秒で切ると、Gemini側では生成中でも応答を捨てて全件再試行してしまう。
+    async with httpx.AsyncClient(timeout=120.0) as client:
         try:
             response = await client.post(url, json=payload)
         except httpx.HTTPError as exc:
-            print(f"[gemini-batch] request failed: {exc!r}")
+            _mark_gemini_key_failure(api_key, None)
+            print(f"[gemini-batch] request failed: {type(exc).__name__}")
             return {}
 
     if response.status_code != 200:
+        if response.status_code == 429:
+            retry_seconds = _gemini_retry_delay(response)
+            _gemini_key_cooldowns[api_key] = time.monotonic() + retry_seconds
+            print(
+                f"[gemini-batch] quota throttled; key cooling down for "
+                f"{retry_seconds:g}s."
+            )
+        else:
+            _mark_gemini_key_failure(api_key, response.status_code)
         print(
             f"[gemini-batch] status={response.status_code} "
             f"body={response.text[:500]}"
         )
         return {}
+    _mark_gemini_key_healthy(api_key)
 
     data = response.json()
     candidates = data.get("candidates") or []
     if not candidates:
         return {}
+    finish_reason = str(candidates[0].get("finishReason") or "")
+    if finish_reason and finish_reason != "STOP":
+        usage = data.get("usageMetadata") or {}
+        print(
+            f"[gemini-batch] finish_reason={finish_reason} "
+            f"output_tokens={usage.get('candidatesTokenCount')}"
+        )
     content = candidates[0].get("content") or {}
     parts = content.get("parts") or []
     text = "".join(
@@ -735,6 +880,72 @@ async def generate_japanese_definitions_batch(requests: list[dict]) -> dict[str,
         if not isinstance(key, str) or not isinstance(value, str):
             continue
         cleaned = _clean_generated_definition(value)
-        if not _is_too_short_japanese_definition(cleaned):
+        if not _is_invalid_japanese_definition(cleaned):
             results[key] = cleaned
+    return results
+
+
+async def generate_japanese_definitions_batch(
+    requests: list[dict],
+    max_attempts: int = 3,
+) -> dict[str, str]:
+    """Generate all definitions, distributing work over every healthy API key."""
+    pending = [
+        item
+        for item in requests
+        if item.get("id") and item.get("term") and item.get("part_of_speech")
+    ]
+    results: dict[str, str] = {}
+    for attempt in range(max_attempts):
+        if not pending:
+            break
+        keys = _available_gemini_keys()
+        if not keys:
+            configured = _configured_gemini_keys()
+            if not configured:
+                break
+            next_ready_at = min(
+                _gemini_key_cooldowns.get(key, 0.0) for key in configured
+            )
+            wait_seconds = max(0.0, next_ready_at - time.monotonic())
+            # Quota retry windows are short enough to wait inside this request.
+            # Invalid/disabled keys use a long cooldown and fail fast instead.
+            if wait_seconds <= 65.0 and attempt + 1 < max_attempts:
+                await asyncio.sleep(wait_seconds)
+                keys = _available_gemini_keys()
+            if not keys:
+                break
+
+        # Two healthy projects process disjoint halves concurrently. With one
+        # healthy key, that key receives the whole remaining set.
+        groups: list[list[dict]] = [[] for _ in keys]
+        for index, item in enumerate(pending):
+            groups[index % len(keys)].append(item)
+        generated_parts = await asyncio.gather(*(
+            _generate_japanese_definitions_batch_once(group, api_key)
+            for api_key, group in zip(keys, groups)
+            if group
+        ))
+        generated = {
+            request_id: definition
+            for part in generated_parts
+            for request_id, definition in part.items()
+        }
+        results.update(generated)
+        pending = [
+            item
+            for item in pending
+            if str(item.get("id")) not in results
+        ]
+        if pending and attempt + 1 < max_attempts:
+            print(
+                f"[gemini-batch] {len(pending)} item(s) missing; "
+                f"retrying ({attempt + 2}/{max_attempts})."
+            )
+            await asyncio.sleep(0.75 * (2 ** attempt))
+    if pending:
+        print(
+            "[gemini-batch] generation remained incomplete for ids="
+            + ",".join(str(item.get("id")) for item in pending)
+        )
     return results

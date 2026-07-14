@@ -24,7 +24,7 @@ boto3==1.34.162
 # dateparser==1.2.2
 # deprecation==2.1.0
 # distro==1.9.0
-en-core-web-sm @ https://github.com/explosion/spacy-models/releases/download/en_core_web_sm-3.7.1/en_core_web_sm-3.7.1-py3-none-any.whl
+en-core-web-trf @ https://github.com/explosion/spacy-models/releases/download/en_core_web_trf-3.7.3/en_core_web_trf-3.7.3-py3-none-any.whl
 # exceptiongroup==1.3.1
 fastapi==0.115.0
 # Flask==3.1.3

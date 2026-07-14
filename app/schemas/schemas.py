@@ -134,6 +134,7 @@ class MaterialResponse(BaseModel):
     thumbnail_object_storage_key: Optional[str] = None
     page_images: list[str] = Field(default_factory=list)
     word_boxes: list[OCRWordBox] = Field(default_factory=list)
+    analysis_summary: Optional[dict[str, Any]] = None
     created_at: datetime
 
 
@@ -241,7 +242,9 @@ class ExtractWordsRequest(BaseModel):
 
 
 class StoredMeaningsRequest(BaseModel):
+    user_id: Optional[str] = None
     items: list[LexicalItem] = Field(default_factory=list)
+    enrich_missing: bool = False
 
 
 class RegenerateJapaneseRequest(BaseModel):
