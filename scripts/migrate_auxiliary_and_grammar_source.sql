@@ -1,4 +1,4 @@
--- Vocamine migration: auxiliary meanings
+-- Glossalyze migration: auxiliary meanings
 -- Run this in Supabase SQL Editor before storing auxiliary meanings.
 -- Safe to run more than once.
 

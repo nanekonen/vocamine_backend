@@ -14,7 +14,7 @@ async def lifespan(_: FastAPI):
     yield
 
 app = FastAPI(
-    title="Vocamine API",
+    title="Glossalyze API",
     description="教材から未知単語を抽出し単語帳を管理するバックエンド",
     version="0.1.0",
     lifespan=lifespan,

@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     azure_document_intelligence_key: str = ""
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash"
-    wiktionary_user_agent: str = "Vocamine/0.1 (local development; contact unset)"
+    wiktionary_user_agent: str = "Glossalyze/0.1 (local development; contact unset)"
     app_env: str = "development"
     # Piper settings are disabled while server-side pronunciation is unused.
     # piper_http_url: str = "http://127.0.0.1:5001"
