@@ -62,7 +62,7 @@ pip install -r requirements.txt
 python -m nltk.downloader -d .venv/nltk_data brown
 ```
 
-`en_core_web_sm`は`requirements.txt`からインストールされるため、別途`python -m spacy download`を実行する必要はありません。
+`en_core_web_md`は`requirements.txt`からインストールされるため、別途`python -m spacy download`を実行する必要はありません。
 
 ### 3. 環境変数
 
@@ -86,6 +86,7 @@ cp .env.example .env
 | `GEMINI_API_KEY` | 日本語語義生成 | Gemini API Key。未設定時は日本語訳の生成・補完不可 |
 | `GEMINI_MODEL` | No | 使用モデル。既定値は`gemini-2.5-flash` |
 | `WIKTIONARY_USER_AGENT` | No | Wiktionary MediaWiki API用User-Agent |
+| `SPACY_MODEL` | No | spaCy英語モデル。既定値は省メモリの`en_core_web_md` |
 | `APP_ENV` | No | 実行環境名。既定値は`development` |
 | `CORS_ORIGINS` | Yes | 許可するフロントエンドOriginのJSON配列 |
 

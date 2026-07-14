@@ -111,7 +111,7 @@ _LEXICAL_ENRICHMENT_LOCK = asyncio.Lock()
 
 @lru_cache(maxsize=1)
 def _get_spacy_nlp():
-    model_name = os.getenv("SPACY_MODEL", "en_core_web_trf")
+    model_name = os.getenv("SPACY_MODEL", "en_core_web_md")
     try:
         # 固有表現抽出は使用しない。品詞、係り受け、原形の処理だけを読み込む。
         return spacy.load(model_name, disable=["ner"])
